@@ -12,7 +12,7 @@ import {
   heartbeatAgent,
 } from "../lib/store.ts";
 
-const AGENT_CAPABILITIES = ["deterministic-cli-v1", "detached-daemon-v1", "command-fallback-v1", "view-parity-v1", "independent-heartbeat-v1", "action-reason-v1"];
+const AGENT_CAPABILITIES = ["deterministic-cli-v1", "detached-daemon-v1", "command-fallback-v1", "view-parity-v1", "independent-heartbeat-v1", "action-reason-v1", "decision-loop-lease-v1"];
 
 interface LegalAction {
   id: string;
@@ -733,6 +733,43 @@ test("one participant-owned Agent pairs, becomes ready, and completes a 1v1 matc
     assert.equal(readyOpponentView.players.find((entry) => entry.id === agentPlayerId)?.agentStatus?.state, "ready");
     assert.equal(readyOwnerView.room.canStart, true);
 
+    const unattendedHeartbeat = await heartbeatAgent(request(agentToken), {
+      room: created.room.code,
+      controlEpoch,
+      seq: 3,
+      observedVersion: readyOwnerView.room.version,
+      decisionId: readyOwnerView.game?.decisionId ?? null,
+      reportedPhase: "unattended",
+      retryCount: 0,
+    }) as { ready: boolean; decisionLoopActive: boolean };
+    assert.equal(unattendedHeartbeat.ready, true, "transport continuity remains established");
+    assert.equal(unattendedHeartbeat.decisionLoopActive, false, "heartbeat-only daemon is not a decision consumer");
+    const unattendedOwnerView = (await getRoom(request(ownerToken), created.room.code)) as TestView;
+    assert.equal(unattendedOwnerView.players.find((entry) => entry.id === agentPlayerId)?.agentStatus?.state, "unattended");
+    assert.equal(unattendedOwnerView.room.canStart, false);
+    assert.deepEqual(unattendedOwnerView.room.startBlockers, [{ code: "AGENT_UNATTENDED", count: 1 }]);
+    await rejectsWithCode(
+      handleOperation(request(ownerToken), { op: "start", room: created.room.code }),
+      "AGENT_UNATTENDED",
+    );
+    assert.ok(unattendedOwnerView.you?.agentDiagnostics?.events.some((event) => event.type === "unattended"));
+
+    const resumedObservation = (await getRoom(request(agentToken), created.room.code)) as TestView;
+    const resumedHeartbeat = await heartbeatAgent(request(agentToken), {
+      room: created.room.code,
+      controlEpoch,
+      seq: 4,
+      observedVersion: resumedObservation.room.version,
+      decisionId: resumedObservation.game?.decisionId ?? null,
+      reportedPhase: "observing",
+      retryCount: 0,
+    }) as { decisionLoopActive: boolean };
+    assert.equal(resumedHeartbeat.decisionLoopActive, true);
+    const resumedOwnerView = (await getRoom(request(ownerToken), created.room.code)) as TestView;
+    assert.equal(resumedOwnerView.players.find((entry) => entry.id === agentPlayerId)?.agentStatus?.state, "ready");
+    assert.equal(resumedOwnerView.room.canStart, true);
+    assert.ok(resumedOwnerView.you?.agentDiagnostics?.events.some((event) => event.type === "attended"));
+
     await handleOperation(request(ownerToken), { op: "start", room: created.room.code });
     const [controllerProjection, ownerProjection, opponentProjection] = await Promise.all([
       getRoom(request(agentToken), created.room.code),
@@ -760,7 +797,7 @@ test("one participant-owned Agent pairs, becomes ready, and completes a 1v1 matc
     assert.equal(typeof opponentCopy.maxHp, "number", "opponents always receive public maximum HP");
     assert.equal(opponentCopy.duelRoster, undefined);
     assert.equal(opponentCopy.duelLineup, undefined);
-    let heartbeatSeq = 2;
+    let heartbeatSeq = 4;
     let agentAcceptedActions = 0;
     let agentPlayPhaseActions = 0;
     let activeNetworkRecoveryChecked = false;

@@ -723,7 +723,8 @@ button:disabled {
 .agent-status-badge.status-acting,
 .agent-status-badge.status-submitting { --agent-color: #62a8a3; }
 .agent-status-badge.status-offline,
-.agent-status-badge.status-timed_out { --agent-color: #df6b5d; }
+.agent-status-badge.status-timed_out,
+.agent-status-badge.status-unattended { --agent-color: #df6b5d; }
 .agent-status-badge.status-safe_mode { --agent-color: #a485bd; }
 .lobby-seat > .agent-status-badge { justify-self: end; }
 .seat-identity-chip { padding: 5px 8px; border: 1px solid rgba(215, 196, 154, 0.18); border-radius: 999px; color: #868980; font-size: 8px; letter-spacing: 0.08em; white-space: nowrap; }
@@ -969,7 +970,8 @@ button:disabled {
 .game-room-meta em.agent-top-status.status-acting,
 .game-room-meta em.agent-top-status.status-submitting { background: rgba(62, 127, 123, 0.2); color: #92cbc5; }
 .game-room-meta em.agent-top-status.status-offline,
-.game-room-meta em.agent-top-status.status-timed_out { background: rgba(198, 61, 47, 0.18); color: #e59688; }
+.game-room-meta em.agent-top-status.status-timed_out,
+.game-room-meta em.agent-top-status.status-unattended { background: rgba(198, 61, 47, 0.18); color: #e59688; }
 .game-room-meta em.agent-top-status.status-safe_mode { background: rgba(128, 91, 153, 0.2); color: #c1a3d4; }
 .game-round { color: var(--muted); font-size: 10px; }
 .game-round > span { padding: 0 9px; border-right: 1px solid var(--line); }
@@ -2443,6 +2445,7 @@ button:disabled { opacity: 1; border-color: rgba(215, 196, 154, 0.1) !important;
 .agent-top-status { min-height: 28px; display: inline-flex; align-items: center; gap: 5px; padding: 0 8px; border: 1px solid rgba(111,179,173,.3); border-radius: 999px; background: rgba(111,179,173,.08); color: #91c5bf; font-size: 10px; font-style: normal; white-space: nowrap; }
 .agent-top-status.status-offline,
 .agent-top-status.status-timed_out,
+.agent-top-status.status-unattended,
 .agent-top-status.status-safe_mode { border-color: rgba(224,106,92,.4); color: #e6988d; }
 
 .player-seat { width: 188px; height: 108px; grid-template-columns: 66px minmax(0,1fr); border-radius: 9px; transition: transform 160ms ease, border-color 160ms ease, box-shadow 160ms ease; }

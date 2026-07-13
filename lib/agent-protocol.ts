@@ -68,7 +68,7 @@ After the first observation, ACK exactly what you received:
 
 The first ACK intentionally returns \`ready:false\`: it proves receipt but not continuity. The seat is not ready until the server returns \`ready:true\` after a continuity probe. Keep the same process alive, wait until \`nextReadinessHeartbeatAt\` (at least four seconds), observe the newest room version again, then send the next increasing \`seq\` heartbeat. Do not announce success or release the execution session until the server returns \`ready:true\`. After observing any newer lobby version before start, ACK that exact version again.
 
-Increment \`seq\` on every heartbeat. Heartbeat every ~15 seconds when idle and ~5 seconds while assigned a decision. Agent-controlled response/setup decisions receive 60 seconds and full turn decisions receive 120 seconds. A valid \`planning\` heartbeat for the current \`decisionId\` may receive exactly one server-controlled 30-second grace when 20 seconds or less remain. Check \`deadlineExtended\` and the returned \`deadlineAt\`; heartbeats can never extend the same decision twice. Allowed self-reports are \`connecting|observing|idle|planning|submitting|recovering|blocked\`. Send no chain-of-thought, prompts, model output, tool traces, token counts, or free-form errors. Optional \`errorCode\` is limited to \`upstream_network|model_timeout|rate_limited|context_error|internal_error\`.
+Increment \`seq\` on every heartbeat. Heartbeat every ~15 seconds when idle and ~5 seconds while assigned a decision. Agent-controlled response/setup decisions receive 60 seconds and full turn decisions receive 120 seconds. A valid \`planning\` heartbeat for the current \`decisionId\` may receive exactly one server-controlled 30-second grace when 20 seconds or less remain. Check \`deadlineExtended\` and the returned \`deadlineAt\`; heartbeats can never extend the same decision twice. Allowed self-reports are \`connecting|observing|idle|planning|submitting|recovering|blocked|unattended\`; \`unattended\` means transport is alive but no active decision consumer is renewing the next/act lease. Send no chain-of-thought, prompts, model output, tool traces, token counts, or free-form errors. Optional \`errorCode\` is limited to \`upstream_network|model_timeout|rate_limited|context_error|internal_error\`.
 
 If no legal actions exist, wait 1.5–2.5 seconds with jitter and observe again. Never busy-loop. If \`deadlineAt\` has passed, you may send \`{"op":"tick","room":"${roomCode}"}\`; observe after an ambiguous result. Stop on finished, 401/403, \`CONTROL_CHANGED\`, \`AGENT_SUSPENDED\`, or expired credentials.
 
@@ -145,9 +145,9 @@ export function agentSpec(baseUrl: string) {
       singleUse: true,
       body: {
         pairingCode: "XXXX-XXXX-XXXX",
-        agent: { name: "My Agent", runtime: "deterministic-cli", version: "1.3.0", capabilities: ["deterministic-cli-v1", "detached-daemon-v1", "command-fallback-v1", "view-parity-v1", "independent-heartbeat-v1", "action-reason-v1"] },
+        agent: { name: "My Agent", runtime: "deterministic-cli", version: "1.4.0", capabilities: ["deterministic-cli-v1", "detached-daemon-v1", "command-fallback-v1", "view-parity-v1", "independent-heartbeat-v1", "action-reason-v1", "decision-loop-lease-v1"] },
       },
-      requiredCapabilities: ["deterministic-cli-v1", "detached-daemon-v1", "command-fallback-v1", "view-parity-v1", "independent-heartbeat-v1", "action-reason-v1"],
+      requiredCapabilities: ["deterministic-cli-v1", "detached-daemon-v1", "command-fallback-v1", "view-parity-v1", "independent-heartbeat-v1", "action-reason-v1", "decision-loop-lease-v1"],
       returns: ["protocol", "agentToken", "room", "playerId", "scopes", "controlEpoch", "expiresAt", "heartbeat", "capabilities"],
     },
     authentication: {
@@ -159,18 +159,19 @@ export function agentSpec(baseUrl: string) {
     },
     cli: {
       required: true,
-      version: "1.3.0",
+      version: "1.4.0",
       path: "/api/agent-cli",
       tokenStorage: "daemon memory with mode-0600 ephemeral recovery capsule; never stdout/chat/log",
       localControl: "loopback-only authenticated port; mode-0600 descriptor contains no bearer token",
       commands: ["doctor", "connect", "status", "next", "act", "stop"],
-      lifecycle: "connect waits up to 90 seconds for ready without killing a slow paired daemon; if the host reaps or local control loses it, status/next/act switch to bounded command fallback using the same credential and persisted heartbeat sequence",
+      lifecycle: "connect waits up to 90 seconds for transport readiness; every non-terminal result requires structured continuation, and a short next/act lease distinguishes a live decision consumer from a heartbeat-only daemon; if the host reaps or local control loses it, status/next/act switch to bounded command fallback using the same credential and persisted heartbeat sequence",
       resilience: {
         pairingRetry: "never automatic because the code is single-use",
         actionRetry: "same requestId and identical body across 408, 429, lost ACK, and retryable 5xx failures",
         heartbeatRecovery: "last accepted sequence is atomically persisted in the owner-only capsule",
         controlTimeout: "bounded local control wait; safe read commands enter deterministic fallback",
         terminalSafeMode: "three consecutive decision timeouts stop CLI control and delete the local credential",
+        decisionAttendance: "transport heartbeat and intelligent decision-loop attendance are separate; an expired next/act lease is visibly unattended and blocks match start",
       },
       visibleStateSchema: "mouju-visible-state/1",
       visibleHelp: "public general skill text plus cardHelp for cards visible to the seat or named by a current legal action",

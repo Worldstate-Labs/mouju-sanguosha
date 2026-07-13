@@ -14,16 +14,18 @@ test("Agent discovery grants only seat-scoped game capabilities", () => {
   assert.equal(spec.pairing.singleUse, true);
   assert.equal(spec.pairing.ownerOnly, true);
   assert.equal(spec.pairing.createsSeat, false);
-  assert.deepEqual(spec.pairing.requiredCapabilities, ["deterministic-cli-v1", "detached-daemon-v1", "command-fallback-v1", "view-parity-v1", "independent-heartbeat-v1", "action-reason-v1"]);
+  assert.deepEqual(spec.pairing.requiredCapabilities, ["deterministic-cli-v1", "detached-daemon-v1", "command-fallback-v1", "view-parity-v1", "independent-heartbeat-v1", "action-reason-v1", "decision-loop-lease-v1"]);
   assert.equal(spec.cli.required, true);
-  assert.equal(spec.cli.version, "1.3.0");
+  assert.equal(spec.cli.version, "1.4.0");
   assert.equal(spec.cli.visibleStateSchema, "mouju-visible-state/1");
   assert.match(spec.cli.visibleHelp, /cardHelp/);
   assert.deepEqual(spec.cli.commands, ["doctor", "connect", "status", "next", "act", "stop"]);
   assert.match(spec.cli.lifecycle, /90 seconds/);
   assert.match(spec.cli.lifecycle, /persisted heartbeat sequence/);
+  assert.match(spec.cli.lifecycle, /short next\/act lease/);
   assert.match(spec.cli.resilience.actionRetry, /lost ACK/);
   assert.match(spec.cli.resilience.terminalSafeMode, /delete the local credential/);
+  assert.match(spec.cli.resilience.decisionAttendance, /visibly unattended/);
   assert.deepEqual(Object.keys(spec.scopes).sort(), [
     "game:act:self",
     "game:heartbeat:self",
@@ -63,6 +65,8 @@ test("Agent skill makes mechanics deterministic and reserves intelligence for de
   assert.match(skill, /Do not re-pair/);
   assert.match(skill, /actionAccepted:true/);
   assert.match(skill, /reasonAccepted:true/);
+  assert.match(skill, /continuation\.required/);
+  assert.match(skill, /waiting:true.*not a stop condition/);
   assert.match(skill, /classic-standard-2009-ex/);
   assert.match(skill, /three-general KOF duel/);
   assert.match(skill, /no room management/);

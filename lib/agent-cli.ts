@@ -1,7 +1,7 @@
 import { CARD_GUIDES } from "./card-catalog.ts";
 import { STANDARD_CHARACTERS } from "./game-v2-data.ts";
 
-export const AGENT_CLI_VERSION = "1.3.0";
+export const AGENT_CLI_VERSION = "1.4.0";
 
 export function agentCliSource() {
   const cardHelp = JSON.stringify(Object.fromEntries(Object.entries(CARD_GUIDES).map(([name, guide]) => [
@@ -18,9 +18,11 @@ import crypto from "node:crypto";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-const CLI_VERSION = "1.3.0";
+const CLI_VERSION = "1.4.0";
 const PROTOCOL = "mouju-agent/2.4";
-const CAPABILITIES = ["deterministic-cli-v1", "detached-daemon-v1", "command-fallback-v1", "view-parity-v1", "independent-heartbeat-v1", "action-reason-v1"];
+const CAPABILITIES = ["deterministic-cli-v1", "detached-daemon-v1", "command-fallback-v1", "view-parity-v1", "independent-heartbeat-v1", "action-reason-v1", "decision-loop-lease-v1"];
+const DECISION_REASONING_LEASE_MS = 75_000;
+const LOOP_REARM_LEASE_MS = 15_000;
 const CARD_HELP = ${cardHelp};
 const GENERAL_HELP = ${generalHelp};
 const argv = process.argv.slice(2);
@@ -33,6 +35,14 @@ function fail(message, code = 1) {
 
 function out(value) {
   process.stdout.write(JSON.stringify(value) + "\n");
+}
+
+function continuation(next, reason) {
+  return { required: true, next, reason };
+}
+
+function terminalContinuation(reason) {
+  return { required: false, next: null, reason };
 }
 
 function option(name, fallback = "") {
@@ -86,6 +96,7 @@ function writeTerminalDescriptor(room, pid, stopReason, errorCode = null) {
   fs.writeFileSync(descriptorPath(room), JSON.stringify({
     cliVersion: CLI_VERSION, protocol: PROTOCOL, room, pid, stopped: true,
     stopReason, errorCode, endedAt: new Date().toISOString(), tokenStored: false,
+    continuation: terminalContinuation(stopReason),
   }), { mode: 0o600 });
 }
 
@@ -134,7 +145,7 @@ async function launchConnect() {
     try { descriptor = JSON.parse(fs.readFileSync(descriptorPath(room), "utf8")); } catch {}
     if (descriptor?.stopped) {
       if (!paired && descriptor.stopReason !== "pair_failed") out({ event: "paired", room, daemonPid: descriptor.pid, tokenPrinted: false });
-      out({ event: "terminal", room, reason: descriptor.stopReason, errorCode: descriptor.errorCode || null, recoverable: descriptor.stopReason === "pair_failed" });
+      out({ event: "terminal", room, reason: descriptor.stopReason, errorCode: descriptor.errorCode || null, recoverable: descriptor.stopReason === "pair_failed", continuation: terminalContinuation(descriptor.stopReason) });
       return;
     }
     if (descriptor?.pid) {
@@ -145,7 +156,7 @@ async function launchConnect() {
       try {
         const status = await control(room, { op: "status" });
         if (status.ready) {
-          out({ event: "ready", room, daemonPid: descriptor.pid, heartbeat: "independent", detached: true });
+          out({ event: "ready", room, daemonPid: descriptor.pid, heartbeat: "independent", detached: true, continuation: continuation("next", "match_not_terminal") });
           return;
         }
       } catch {}
@@ -157,7 +168,7 @@ async function launchConnect() {
   // A slow or temporarily disconnected network must not destroy a successfully
   // paired session. Leave the daemon and recovery capsule alive; status/next
   // will deterministically resume without consuming another pairing code.
-  out({ event: "connecting", room, daemonPid: child.pid, recoverable: true, next: "status", tokenPrinted: false });
+  out({ event: "connecting", room, daemonPid: child.pid, recoverable: true, next: "status", tokenPrinted: false, continuation: continuation("status", "readiness_pending") });
 }
 
 class RemoteError extends Error {
@@ -250,6 +261,7 @@ function publicDecision(view) {
   };
   return {
     schema: "mouju-visible-state/1",
+    continuation: continuation("act", "decision_ready"),
     serverTime: view.serverTime,
     room: view.room,
     you: view.you ? {
@@ -344,6 +356,7 @@ async function connectMode() {
     origin, room, token, controlEpoch: pair.controlEpoch, seq: 0,
     view: null, ready: false, stopped: false, phase: "connecting",
     stopReason: null, lastHeartbeatAt: null, lastObserveAt: null, lastActionAt: null, lastError: null,
+    nextWaiters: 0, decisionLeaseUntil: 0, decisionLeaseId: null,
   };
   let observePromise = null;
   let heartbeatPromise = null;
@@ -450,8 +463,10 @@ async function connectMode() {
         state.view = result;
         state.lastActionAt = new Date().toISOString();
         state.phase = "observing";
+        state.decisionLeaseId = null;
+        state.decisionLeaseUntil = Date.now() + LOOP_REARM_LEASE_MS;
         state.lastError = null;
-        return { receipt: result.agentReceipt, roomVersion: result.room.version };
+        return { receipt: result.agentReceipt, roomVersion: result.room.version, continuation: continuation("next", "match_not_terminal") };
       } catch (error) {
         lastError = error;
         if (error instanceof RemoteError && error.status === 429) retryAfter = error.retryAfterMs;
@@ -463,28 +478,68 @@ async function connectMode() {
 
   async function waitForDecision(waitMs) {
     const end = Date.now() + waitMs;
-    while (!state.stopped && Date.now() <= end) {
+    state.nextWaiters += 1;
+    state.phase = "observing";
+    try {
       await observe();
-      if ((state.view?.game?.legalActions || []).length > 0) {
-        state.phase = "planning";
-        await heartbeat("planning");
-        if (state.stopped) return { waiting: false, stopped: true, status: statusView() };
-        return publicDecision(state.view);
+      await heartbeat((state.view?.game?.legalActions || []).length > 0 ? "planning" : "observing");
+      while (!state.stopped && Date.now() <= end) {
+        await observe();
+        if ((state.view?.game?.legalActions || []).length > 0) {
+          state.phase = "planning";
+          state.decisionLeaseId = state.view.game?.decisionId || null;
+          state.decisionLeaseUntil = Date.now() + DECISION_REASONING_LEASE_MS;
+          await heartbeat("planning");
+          if (state.stopped) {
+            return {
+              waiting: false,
+              stopped: true,
+              status: statusView(),
+              continuation: terminalContinuation(state.stopReason || "session_stopped"),
+            };
+          }
+          return publicDecision(state.view);
+        }
+        await sleep(700);
       }
-      await sleep(700);
+      state.decisionLeaseId = null;
+      state.decisionLeaseUntil = Date.now() + LOOP_REARM_LEASE_MS;
+      return {
+        waiting: !state.stopped,
+        stopped: state.stopped,
+        status: statusView(),
+        continuation: state.stopped
+          ? terminalContinuation(state.stopReason || "session_stopped")
+          : continuation("next", "still_waiting"),
+      };
+    } finally {
+      state.nextWaiters = Math.max(0, state.nextWaiters - 1);
     }
-    return { waiting: !state.stopped, stopped: state.stopped, status: statusView() };
+  }
+
+  function decisionLoopActive() {
+    return state.nextWaiters > 0 || Date.now() < state.decisionLeaseUntil;
+  }
+
+  function scheduledPhase() {
+    if (!decisionLoopActive()) return "unattended";
+    return (state.view?.game?.legalActions || []).length > 0 ? "planning" : "observing";
   }
 
   function statusView() {
     return {
       cliVersion: CLI_VERSION, protocol: PROTOCOL, room, pid: process.pid,
       ready: state.ready, phase: state.phase, stopped: state.stopped, stopReason: state.stopReason,
+      decisionLoopActive: decisionLoopActive(),
+      decisionLeaseUntil: state.decisionLeaseUntil ? new Date(state.decisionLeaseUntil).toISOString() : null,
       roomVersion: state.view?.room?.version || null,
       decisionId: state.view?.game?.decisionId || null,
       actionRequired: Boolean(state.view?.game?.legalActions?.length),
       lastHeartbeatAt: state.lastHeartbeatAt, lastObserveAt: state.lastObserveAt,
       lastActionAt: state.lastActionAt, lastError: state.lastError,
+      continuation: state.stopped
+        ? terminalContinuation(state.stopReason || "session_stopped")
+        : continuation("next", "match_not_terminal"),
     };
   }
 
@@ -492,7 +547,10 @@ async function connectMode() {
     if (message.op === "status") return statusView();
     if (message.op === "next") return waitForDecision(Math.max(0, Math.min(180000, Number(message.waitMs) || 0)));
     if (message.op === "act") return submit(message.payload || {});
-    if (message.op === "stop") { markStopped("stopped_by_owner"); return { stopped: true, stopReason: state.stopReason }; }
+    if (message.op === "stop") {
+      markStopped("stopped_by_owner");
+      return { stopped: true, stopReason: state.stopReason, continuation: terminalContinuation(state.stopReason) };
+    }
     throw new Error("Unknown control operation");
   }
 
@@ -538,7 +596,7 @@ async function connectMode() {
         await sleep(1800);
       }
     }
-    if (state.ready) out({ event: "ready", room, session: descriptor, heartbeat: "independent" });
+    if (state.ready) out({ event: "ready", room, session: descriptor, heartbeat: "independent", continuation: continuation("next", "match_not_terminal") });
   }
 
   function scheduleObserve() {
@@ -558,7 +616,11 @@ async function connectMode() {
     if (state.stopped) return;
     heartbeatTimer = setTimeout(async () => {
       heartbeatTimer = null;
-      try { await heartbeat(state.view?.game?.legalActions?.length ? "planning" : "idle"); if (!state.stopped) state.lastError = null; }
+      try {
+        state.phase = scheduledPhase();
+        await heartbeat(state.phase);
+        if (!state.stopped) state.lastError = null;
+      }
       catch (error) {
         state.lastError = error.remoteCode || error.message;
         if ([401, 403].includes(error.status) || error.remoteCode === "CONTROL_CHANGED") markStopped("authorization_ended", state.lastError);
@@ -588,10 +650,14 @@ async function connectMode() {
   process.once("SIGTERM", () => { cleanup(); process.exit(0); });
 
   await establishReadiness();
+  if (state.ready && !state.stopped) {
+    state.phase = "unattended";
+    await heartbeat("unattended");
+  }
   scheduleObserve();
   scheduleHeartbeat();
   while (!state.stopped) await sleep(1000);
-  out({ event: "terminal", room, reason: state.stopReason || "session_stopped", errorCode: state.lastError });
+  out({ event: "terminal", room, reason: state.stopReason || "session_stopped", errorCode: state.lastError, continuation: terminalContinuation(state.stopReason || "session_stopped") });
   cleanup();
 }
 
@@ -671,27 +737,29 @@ async function directControl(room, message, formerPid = null) {
     if (result.suspended) terminal("safe_mode", "AGENT_SUSPENDED");
     return result;
   };
-  const status = (ready = true, phase = "command_fallback") => ({
+  const status = (ready = true, phase = "unattended") => ({
     cliVersion: CLI_VERSION, protocol: PROTOCOL, room, pid: formerPid,
     mode: "command_fallback", daemonAlive: false, ready, phase,
+    decisionLoopActive: phase === "planning" || phase === "observing" || phase === "submitting",
     stopped: false, stopReason: null,
     roomVersion: view?.room?.version || null,
     decisionId: view?.game?.decisionId || null,
     actionRequired: Boolean(view?.game?.legalActions?.length),
     lastHeartbeatAt, lastObserveAt: view?.serverTime || null,
     lastActionAt: null, lastError: null,
+    continuation: continuation("next", "match_not_terminal"),
   });
 
   if (message.op === "stop") {
     terminal("stopped_by_owner");
-    return { stopped: true, stopReason: "stopped_by_owner", mode: "command_fallback" };
+    return { stopped: true, stopReason: "stopped_by_owner", mode: "command_fallback", continuation: terminalContinuation("stopped_by_owner") };
   }
   if (message.op === "status") {
     await observe();
     if (view.room?.status === "finished" || view.game?.status === "finished") return readDescriptor(room, true);
-    const probe = await heartbeat(view.game?.legalActions?.length ? "planning" : "idle");
+    const probe = await heartbeat("unattended");
     if (probe.suspended) return readDescriptor(room, true);
-    return status(Boolean(probe.ready));
+    return status(Boolean(probe.ready), "unattended");
   }
   if (message.op === "next") {
     const end = Date.now() + Math.max(0, Math.min(180000, Number(message.waitMs) || 0));
@@ -699,18 +767,30 @@ async function directControl(room, message, formerPid = null) {
     do {
       await observe();
       if (view.room?.status === "finished" || view.game?.status === "finished") {
-        return { waiting: false, stopped: true, status: readDescriptor(room, true) };
+        return {
+          waiting: false,
+          stopped: true,
+          status: readDescriptor(room, true),
+          continuation: terminalContinuation("match_finished"),
+        };
       }
       if ((view.game?.legalActions || []).length > 0) {
         const probe = await heartbeat("planning");
-        if (probe.suspended) return { waiting: false, stopped: true, status: readDescriptor(room, true) };
+        if (probe.suspended) {
+          return {
+            waiting: false,
+            stopped: true,
+            status: readDescriptor(room, true),
+            continuation: terminalContinuation("safe_mode"),
+          };
+        }
         return publicDecision(view);
       }
-      if (Date.now() >= nextHeartbeat) { await heartbeat("idle"); nextHeartbeat = Date.now() + 9000; }
+      if (Date.now() >= nextHeartbeat) { await heartbeat("observing"); nextHeartbeat = Date.now() + 9000; }
       if (Date.now() >= end) break;
       await sleep(700);
     } while (Date.now() <= end);
-    return { waiting: true, stopped: false, status: status(true, "idle") };
+    return { waiting: true, stopped: false, status: status(true, "observing"), continuation: continuation("next", "still_waiting") };
   }
   if (message.op === "act") {
     const payload = message.payload || {};
@@ -735,7 +815,7 @@ async function directControl(room, message, formerPid = null) {
         if (result.agentReceipt?.requestId !== requestId || result.agentReceipt?.actionAccepted !== true || result.agentReceipt?.reasonAccepted !== true) {
           throw new Error("Server action receipt failed validation");
         }
-        return { receipt: result.agentReceipt, roomVersion: result.room.version, mode: "command_fallback" };
+        return { receipt: result.agentReceipt, roomVersion: result.room.version, mode: "command_fallback", continuation: continuation("next", "match_not_terminal") };
       } catch (error) {
         lastError = error;
         if (error instanceof RemoteError && error.status === 429) retryAfter = error.retryAfterMs;

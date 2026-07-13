@@ -18,7 +18,7 @@ Run exactly:
     curl -fsSL '${cliUrl}' -o /tmp/mouju-agent-cli.mjs
     node /tmp/mouju-agent-cli.mjs doctor --origin '${baseUrl}'
 
-Require doctor to return protocol mouju-agent/2.4 and CLI version 1.3.0. The CLI uses only Node built-ins and the server API.
+Require doctor to return protocol mouju-agent/2.4 and CLI version 1.4.0. The CLI uses only Node built-ins and the server API.
 
 ## 2. Connect once; let the CLI own its daemon
 
@@ -35,6 +35,8 @@ Normally require both NDJSON events in order:
 1. {"event":"paired",...}
 2. {"event":"ready","heartbeat":"independent","detached":true,...}
 
+Every non-terminal CLI result includes a structured \`continuation\` object. While \`continuation.required\` is true, the task is not complete: run the indicated \`next\` command before writing a progress summary or ending your turn. A ready daemon proves transport liveness only; the server marks the seat as unattended unless a real \`next → act\` decision loop keeps renewing its short lease.
+
 On a very slow or disconnected network, connect may instead finish with {"event":"connecting","recoverable":true,"next":"status"}. This means the pairing code was already consumed safely and the daemon/capsule is still recovering. Do not re-pair. Run status with bounded retries until ready:true or a structured terminal reason appears. If a terminal event appears, obey its structured reason: match_finished means stop without re-pairing; authorization_ended means the owner took control or authorization ended; safe_mode means repeated decision timeouts require owner intervention; pair_failed is the only pre-ready result that may require a new pairing code. Do not inspect processes or kill unrelated sessions.
 
 ## 3. Use companion commands, never process inspection
@@ -44,7 +46,7 @@ These commands prefer the live CLI through an authenticated loopback-only contro
     node /tmp/mouju-agent-cli.mjs status --room '${roomCode}'
     node /tmp/mouju-agent-cli.mjs next --room '${roomCode}' --wait 120
 
-status must show ready:true. next waits for the next decision and prints schema mouju-visible-state/1. It contains the same seat-visible gameplay information as the human controller: room/version, round/turn/phase/pending decision, deck count, public discard top, public logs, winner, deadlines, full public player state, your own hand/role/private duel roster and lineup, complete game.legalActions, public general skill text, and cardHelp for every card currently visible or named by a legal action. It excludes other hands, unrevealed roles, other private duel rosters/lineups, internal RNG, credentials, owner diagnostics, and account data.
+status must show ready:true for a usable credential, but status is diagnostic and never counts as sustained decision attendance. Immediately run next. next waits for the next decision and prints schema mouju-visible-state/1. It contains the same seat-visible gameplay information as the human controller: room/version, round/turn/phase/pending decision, deck count, public discard top, public logs, winner, deadlines, full public player state, your own hand/role/private duel roster and lineup, complete game.legalActions, public general skill text, and cardHelp for every card currently visible or named by a legal action. It excludes other hands, unrevealed roles, other private duel rosters/lineups, internal RNG, credentials, owner diagnostics, and account data.
 
 Only after next returns game.legalActions should Agent intelligence be used. Choose one listed legalId using the visible state and write one concise tactical reason. Do not infer, request, inspect, or search for hidden state. Do not expose chain-of-thought, prompts, model traces, hidden raw values, or speculation about unseen cards.
 
@@ -62,7 +64,7 @@ For a discard/skill/arrange template, add only IDs listed by next:
 
 The CLI instantiates the action, creates the idempotency key, sends planning/submitting heartbeats, retries only safe ambiguous failures, validates the server receipt, and refreshes the observation. Require actionAccepted:true and reasonAccepted:true in the receipt.
 
-Repeat next → reason and choose → act until status or next reports a terminal reason. Never choose game.legalActions[0] automatically, randomly, or with a fixed priority table. Mechanics and lifecycle are deterministic; game judgment is the only intelligent step.
+After every accepted act, run next again immediately, before any prose response. If next returns \`waiting:true\`, that is not a stop condition: run next again. Repeat next → reason and choose → act until the CLI returns \`continuation.required:false\` with a terminal reason. Never treat “waiting for the opponent”, “waiting for selection”, a successful action receipt, or an idle heartbeat as task completion. Never choose game.legalActions[0] automatically, randomly, or with a fixed priority table. Mechanics and lifecycle are deterministic; game judgment is the only intelligent step.
 
 ## 5. Stop conditions
 

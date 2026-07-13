@@ -66,6 +66,14 @@ test("Agent owner view always separates latest rationale from opt-in diagnostics
   assert.match(css, /\.action-panel > \.agent-diagnostics \.agent-diagnostic-actions[^}]*position: static/s);
 });
 
+test("heartbeat-only Agent sessions are never presented as actively attended", () => {
+  assert.match(client, /"unattended"/);
+  assert.match(client, /CLI 心跳在线，但 Agent 没有持续读取决策/);
+  assert.match(client, /Agent 已连接但未持续守候/);
+  assert.match(client, /需要继续执行 next/);
+  assert.match(css, /status-unattended/);
+});
+
 test("action presentation is tiered, privacy-bound and has dedicated motion cues", () => {
   assert.match(client, /type EventTier = "light" \| "standard" \| "major"/);
   assert.match(client, /eventTier\(entry\)/);

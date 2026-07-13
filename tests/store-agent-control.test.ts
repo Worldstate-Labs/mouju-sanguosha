@@ -4,7 +4,7 @@ import { DatabaseSync } from "node:sqlite";
 import { runWithBindings } from "../lib/runtime-env.ts";
 import { ApiError, claimAgentPairing, getRoom, handleOperation } from "../lib/store.ts";
 
-const AGENT_CAPABILITIES = ["deterministic-cli-v1", "detached-daemon-v1", "command-fallback-v1", "view-parity-v1", "independent-heartbeat-v1", "action-reason-v1"];
+const AGENT_CAPABILITIES = ["deterministic-cli-v1", "detached-daemon-v1", "command-fallback-v1", "view-parity-v1", "independent-heartbeat-v1", "action-reason-v1", "decision-loop-lease-v1"];
 
 interface TestResult {
   players: Array<{ id: string; agentStatus?: { state: string; label: string } }>;

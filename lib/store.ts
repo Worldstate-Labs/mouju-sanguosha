@@ -18,7 +18,7 @@ type RoomStatus = "lobby" | "playing" | "finished";
 type PrincipalType = "guest" | "account" | "agent";
 type ControlMode = "human" | "pairing" | "agent";
 type AuthVia = "guest" | "account" | "agent";
-type AgentReportedPhase = "connecting" | "observing" | "idle" | "planning" | "submitting" | "recovering" | "blocked";
+type AgentReportedPhase = "connecting" | "observing" | "idle" | "planning" | "submitting" | "recovering" | "blocked" | "unattended";
 type AgentPublicState =
   | "pairing"
   | "pairing_expired"
@@ -30,14 +30,15 @@ type AgentPublicState =
   | "delayed"
   | "offline"
   | "timed_out"
-  | "safe_mode";
+  | "safe_mode"
+  | "unattended";
 
 const GUEST_TTL_MS = 24 * 60 * 60 * 1000;
 const AGENT_TTL_MS = 24 * 60 * 60 * 1000;
 const PAIRING_TTL_MS = 5 * 60 * 1000;
 const AGENT_SCOPES = ["game:observe:self", "game:act:self", "game:heartbeat:self"];
 const AGENT_PROTOCOL = "mouju-agent/2.4";
-const AGENT_REQUIRED_CAPABILITIES = ["deterministic-cli-v1", "detached-daemon-v1", "command-fallback-v1", "view-parity-v1", "independent-heartbeat-v1", "action-reason-v1"] as const;
+const AGENT_REQUIRED_CAPABILITIES = ["deterministic-cli-v1", "detached-daemon-v1", "command-fallback-v1", "view-parity-v1", "independent-heartbeat-v1", "action-reason-v1", "decision-loop-lease-v1"] as const;
 const AGENT_RESPONSE_WINDOW_MS = 60_000;
 const AGENT_TURN_WINDOW_MS = 120_000;
 const HUMAN_RESPONSE_WINDOW_MS = 35_000;
@@ -58,6 +59,7 @@ const AGENT_PHASES = new Set<AgentReportedPhase>([
   "submitting",
   "recovering",
   "blocked",
+  "unattended",
 ]);
 const AGENT_REPORTED_ERRORS = new Set([
   "upstream_network",
@@ -789,6 +791,11 @@ function agentPublicStatus(
         state = "timed_out";
         label = "本次已超时托管";
         attention = "warning";
+      } else if (credential.reported_phase === "unattended") {
+        state = "unattended";
+        label = activeDecision ? "Agent 未守候本次行动" : "Agent 未持续守候";
+        attention = "critical";
+        ready = false;
       } else if (activeDecision && credential.reported_phase === "submitting") {
         state = "submitting";
         label = "Agent 正在提交";
@@ -847,6 +854,10 @@ function startBlockers(
     }
     if (!credential.last_heartbeat_at || (ageMs(credential.last_heartbeat_at) ?? Infinity) > 60_000) {
       add("AGENT_OFFLINE");
+      continue;
+    }
+    if (credential.reported_phase === "unattended") {
+      add("AGENT_UNATTENDED");
     }
   }
   return [...counts].map(([code, count]) => ({ code, count }));
@@ -860,6 +871,8 @@ function eventSummary(event: AgentEventRow) {
     action_rejected: `动作被服务器拒绝${event.error_code ? ` · ${event.error_code}` : ""}`,
     timeout: "本次行动超时，服务器执行安全默认动作",
     suspended: "连续超时，已切换为系统安全托管",
+    unattended: "CLI 在线，但 Agent 决策循环没有持续守候",
+    attended: "Agent 已恢复持续守候",
     takeover: "席位所有者已收回真人控制",
   };
   return summaries[event.type] ?? "Agent 状态已更新";
@@ -1716,6 +1729,21 @@ export async function heartbeatAgent(request: Request, payload: Record<string, u
         .bind(eventId(), room.code, agent.id, credential.id, room.version)
         .run();
     }
+    const phaseEvent = credential.reported_phase !== phase
+      ? phase === "unattended"
+        ? "unattended"
+        : credential.reported_phase === "unattended"
+          ? "attended"
+          : null
+      : null;
+    if (phaseEvent && (credential.ready_at || provesPersistentSession)) {
+      await database()
+        .prepare(`INSERT INTO agent_events
+          (id, room_code, target_player_id, credential_id, type, game_version)
+          VALUES (?, ?, ?, ?, ?, ?)`)
+        .bind(eventId(), room.code, agent.id, credential.id, phaseEvent, room.version)
+        .run();
+    }
   }
 
   const updated = await database()
@@ -1781,6 +1809,7 @@ export async function heartbeatAgent(request: Request, payload: Record<string, u
       ? new Date(timestamp(updated.last_heartbeat_at) + AGENT_READY_PROBE_MS).toISOString()
       : null,
     health: health.state,
+    decisionLoopActive: phase !== "unattended",
     actionRequired: isDecisionActor,
     decisionId: currentDecisionId,
     deadlineAt: effectiveDeadlineAt,
@@ -2033,6 +2062,9 @@ export async function startRoom(request: Request, payload: Record<string, unknow
   if (blockers.some((entry) => entry.code === "AGENT_NOT_READY")) {
     throw new ApiError(409, "AGENT_NOT_READY", "有 Agent 尚未确认最新房间快照，请等待其完成同步");
   }
+  if (blockers.some((entry) => entry.code === "AGENT_UNATTENDED")) {
+    throw new ApiError(409, "AGENT_UNATTENDED", "有 Agent 的 CLI 已连接，但决策循环没有持续守候，暂时不能开局");
+  }
   if (blockers.some((entry) => entry.code === "AGENT_OFFLINE")) {
     throw new ApiError(409, "AGENT_OFFLINE", "有 Agent 已离线、暂停或心跳过期，暂时不能开局");
   }
@@ -2056,6 +2088,7 @@ export async function startRoom(request: Request, payload: Record<string, unknow
                 WHERE c.room_code = p.room_code AND c.target_player_id = p.id
                   AND c.control_epoch = p.control_epoch AND c.revoked_at IS NULL AND c.expires_at > ?
                   AND c.ready_at IS NOT NULL AND c.suspended_at IS NULL
+                  AND c.reported_phase <> 'unattended'
                   AND c.last_observed_version = rooms.version
                   AND c.last_heartbeat_at IS NOT NULL
                   AND julianday(c.last_heartbeat_at) >= julianday('now', '-60 seconds')

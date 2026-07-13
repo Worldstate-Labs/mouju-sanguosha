@@ -84,7 +84,8 @@ type AgentPublicState =
   | "delayed"
   | "offline"
   | "timed_out"
-  | "safe_mode";
+  | "safe_mode"
+  | "unattended";
 
 interface AgentPublicStatus {
   state: AgentPublicState;
@@ -171,7 +172,7 @@ interface RoomView {
     version: number;
     canStart: boolean;
     startBlockers: Array<{
-      code: "NOT_ENOUGH_PLAYERS" | "AGENT_PAIRING" | "AGENT_NOT_READY" | "AGENT_OFFLINE";
+      code: "NOT_ENOUGH_PLAYERS" | "AGENT_PAIRING" | "AGENT_NOT_READY" | "AGENT_OFFLINE" | "AGENT_UNATTENDED";
       count: number;
     }>;
   };
@@ -428,6 +429,7 @@ const PHASE_LABELS: Record<string, string> = {
   submitting: "提交动作",
   recovering: "重试恢复",
   blocked: "遇到阻塞",
+  unattended: "未持续守候",
   prepare: "准备阶段",
   judge: "判定阶段",
   draw: "摸牌阶段",
@@ -512,7 +514,7 @@ const IDENTITY_ROLE_SUMMARY: Record<number, string> = {
 };
 
 function agentIcon(state: AgentPublicState): IconName {
-  if (["offline", "timed_out", "safe_mode", "pairing_expired"].includes(state)) return "warning";
+  if (["offline", "timed_out", "safe_mode", "pairing_expired", "unattended"].includes(state)) return "warning";
   if (["connecting", "pairing", "delayed"].includes(state)) return "refresh";
   if (["acting", "submitting"].includes(state)) return "activity";
   return "shield";
@@ -773,7 +775,7 @@ function AgentDiagnosticsPanel({
     label: diagnostics.label,
     ready: Boolean(diagnostics.readyAt),
     activeDecision: false,
-    attention: diagnostics.state === "offline" || diagnostics.state === "safe_mode" ? "critical" : "none",
+    attention: ["offline", "safe_mode", "unattended"].includes(diagnostics.state) ? "critical" : "none",
     lastSeenApprox: null,
     consecutiveTimeouts: diagnostics.consecutiveTimeouts,
   };
@@ -786,9 +788,9 @@ function AgentDiagnosticsPanel({
       : attemptedAt
         ? `等待服务器确认 · ${relativeTime(diagnostics.lastActionAttemptAt)}`
         : "尚未提交动作";
-  const needsAttention = ["offline", "timed_out", "safe_mode", "pairing_expired"].includes(diagnostics.state);
+  const needsAttention = ["offline", "timed_out", "safe_mode", "pairing_expired", "unattended"].includes(diagnostics.state);
   const requiresNewAuthorization = ["safe_mode", "pairing_expired"].includes(diagnostics.state);
-  const sameCredentialCanRecover = diagnostics.state === "offline" && !diagnostics.suspendedAt;
+  const sameCredentialCanRecover = ["offline", "unattended"].includes(diagnostics.state) && !diagnostics.suspendedAt;
   const versionGap = Math.max(0, diagnostics.currentVersion - (diagnostics.lastObservedVersion ?? diagnostics.currentVersion));
   const actionReasons = diagnostics.events.filter((event) => event.type === "action_accepted");
   const latestReason = actionReasons[0];
@@ -800,7 +802,9 @@ function AgentDiagnosticsPanel({
       ? "正在分析当前局面"
       : diagnostics.reportedPhase === "submitting"
         ? "正在提交并确认动作"
-        : sameCredentialCanRecover
+        : diagnostics.state === "unattended"
+          ? "CLI 仍连接，但 Agent 已停止持续读取决策"
+          : sameCredentialCanRecover
           ? "心跳中断，原凭证仍可恢复"
           : diagnostics.state === "timed_out"
             ? "本次已安全托管，Agent 仍可继续"
@@ -824,7 +828,7 @@ function AgentDiagnosticsPanel({
         </div>
         {olderReasons.length > 0 && <div className="agent-reason-scroll" tabIndex={0} aria-label="可独立滚动的历史 Agent 决策理由"><ol aria-label="历史 Agent 决策理由">{olderReasons.map((event) => <li key={event.id}><i><Icon name="check" size={11} /></i><div><p>{event.reason || "Agent 未提供本次理由"}</p><small>{event.summary} · {relativeTime(event.at)}</small></div></li>)}</ol></div>}
       </section>
-      {sameCredentialCanRecover && <div className="agent-recovery-note"><Icon name="refresh" size={14} /><span><b>先恢复原会话</b>让 Agent 按 Skill 再执行 status；不要重新领取配对码。原凭证、席位和当前牌局仍然有效。</span></div>}
+      {sameCredentialCanRecover && <div className="agent-recovery-note"><Icon name="refresh" size={14} /><span><b>{diagnostics.state === "unattended" ? "让 Agent 继续守候" : "先恢复原会话"}</b>{diagnostics.state === "unattended" ? "让原 Agent 立即继续执行 Skill 的 next → act 循环；不要把后台心跳当作决策仍在运行。" : "让 Agent 按 Skill 再执行 status；不要重新领取配对码。原凭证、席位和当前牌局仍然有效。"}</span></div>}
       <div className="agent-diagnostic-actions">
         {requiresNewAuthorization && <button onClick={onRepair} disabled={busy}><Icon name="refresh" size={14} />重新授权 Agent</button>}
         {sameCredentialCanRecover && <button className="reauthorize-secondary" onClick={onRepair} disabled={busy}><Icon name="link" size={14} />确认旧会话失效后重配</button>}
@@ -1130,6 +1134,7 @@ function AgentModal({
   const claimed = Boolean(status && !["pairing", "pairing_expired"].includes(status.state));
   const snapshotReceived = claimed && Boolean(diagnostics?.lastSnapshotAt);
   const ready = snapshotReceived && Boolean(diagnostics?.readyAt && status?.ready);
+  const attendanceMissing = status?.state === "unattended";
   const connectionFailed = claimed && Boolean(status && ["offline", "safe_mode"].includes(status.state));
   const countdown = `${String(Math.floor(secondsRemaining / 60)).padStart(2, "0")}:${String(secondsRemaining % 60).padStart(2, "0")}`;
   return (
@@ -1142,8 +1147,8 @@ function AgentModal({
         <ol className="pairing-progress" aria-label="Agent 接入进度">
           <li className={claimed ? "complete" : expired ? "failed" : "active"}><Icon name={claimed ? "check" : expired ? "warning" : "clock"} /><span>{claimed ? "CLI 已领取凭证" : expired ? "配对码已过期" : "等待 CLI 领取"}</span></li>
           <li className={snapshotReceived ? "complete" : connectionFailed ? "failed" : claimed ? "active" : ""}><Icon name={snapshotReceived ? "check" : connectionFailed ? "warning" : "link"} /><span>{snapshotReceived ? "CLI 已读取牌桌" : connectionFailed ? "读取牌桌超时" : "CLI 读取牌桌"}</span></li>
-          <li className={ready ? "complete" : connectionFailed && snapshotReceived ? "failed" : snapshotReceived ? "active" : ""}><Icon name={ready ? "check" : connectionFailed && snapshotReceived ? "warning" : "refresh"} /><span>{ready ? "双心跳已验证" : connectionFailed && snapshotReceived ? "持续心跳超时" : "验证双心跳"}</span></li>
-          <li className={ready ? "complete" : ""}><Icon name="check" /><span>{ready ? "CLI 会话已就绪" : "保持 CLI 会话"}</span></li>
+          <li className={ready ? "complete" : (connectionFailed || attendanceMissing) && snapshotReceived ? "failed" : snapshotReceived ? "active" : ""}><Icon name={ready ? "check" : (connectionFailed || attendanceMissing) && snapshotReceived ? "warning" : "refresh"} /><span>{ready ? "心跳与持续守候已验证" : attendanceMissing ? "Agent 未开始持续守候" : connectionFailed && snapshotReceived ? "持续心跳超时" : "验证心跳与守候"}</span></li>
+          <li className={ready ? "complete" : attendanceMissing ? "failed" : ""}><Icon name={attendanceMissing ? "warning" : "check"} /><span>{ready ? "CLI 会话已就绪" : attendanceMissing ? "需要继续执行 next" : "保持 CLI 会话"}</span></li>
         </ol>
         <div className="agent-token-block pairing-code-block">
           <span><Icon name="person" size={14} />席位</span><strong>{pairing.seatName}</strong>
@@ -1152,6 +1157,8 @@ function AgentModal({
         </div>
         {ready
           ? <button type="button" className="pairing-complete" onClick={onClose}><Icon name="check" size={16} />Agent 已就绪，完成</button>
+          : attendanceMissing
+            ? <div className="pairing-live-status" role="alert"><Icon name="warning" size={18} /><b>CLI 心跳在线，但 Agent 没有持续读取决策</b><small>让原 Agent 继续严格执行 Skill；不要重新配对，也不要只运行 status。</small></div>
           : connectionFailed
             ? <button type="button" className="pairing-refresh" onClick={onRefresh}><Icon name="refresh" size={16} />接入超时，生成新的配对码</button>
           : claimed
@@ -1345,6 +1352,8 @@ function Lobby({
       ? `${blocker.count} 个席位等待 Agent 领取`
       : blocker.code === "AGENT_NOT_READY"
         ? `${blocker.count} 个 Agent 尚未同步最新快照`
+        : blocker.code === "AGENT_UNATTENDED"
+          ? `${blocker.count} 个 Agent 已连接但未持续守候`
         : `${blocker.count} 个 Agent 离线或心跳过期`;
   const primaryBlocker = view.room.startBlockers[0] ? blockerText(view.room.startBlockers[0]) : null;
   const startLabel = primaryBlocker ?? (duel ? "开始经典 1V1" : "开始身份局");
@@ -1404,7 +1413,7 @@ function Lobby({
               <div className={`seat-control-box ${agentControlsMySeat ? "delegated" : pairingMySeat ? "pairing" : ""}`}>
                 <span><Icon name={agentControlsMySeat ? "refresh" : pairingMySeat ? "link" : "person"} size={14} />我的席位</span>
                 <strong>{agentControlsMySeat ? "Agent 正在建立可信连接" : pairingMySeat ? "等待你的 Agent 完成配对" : "当前由本人参与"}</strong>
-                <small>{agentControlsMySeat ? "完成首次快照确认和近期心跳后才会显示就绪" : pairingMySeat ? "配对码五分钟内、仅可使用一次；过期可重新生成" : "只有你能决定是否把自己的席位交给 Agent"}</small>
+                <small>{agentControlsMySeat ? "完成首次快照、双心跳并进入持续 next 守候后才会显示就绪" : pairingMySeat ? "配对码五分钟内、仅可使用一次；过期可重新生成" : "只有你能决定是否把自己的席位交给 Agent"}</small>
                 <div className="seat-control-actions">
                   {pairingMySeat ? (
                     <><button onClick={onCreatePairing} disabled={busy}>重新生成配对码</button><button className="takeover" onClick={onRevokeAgent} disabled={busy}>改由本人参与</button></>

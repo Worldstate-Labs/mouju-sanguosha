@@ -9,7 +9,7 @@ import { agentCliSource } from "../lib/agent-cli.ts";
 
 const ROOM = "QA8K2M";
 const TOKEN = "agent_test_secret_must_never_be_printed";
-const CAPABILITIES = ["deterministic-cli-v1", "detached-daemon-v1", "command-fallback-v1", "view-parity-v1", "independent-heartbeat-v1", "action-reason-v1"];
+const CAPABILITIES = ["deterministic-cli-v1", "detached-daemon-v1", "command-fallback-v1", "view-parity-v1", "independent-heartbeat-v1", "action-reason-v1", "decision-loop-lease-v1"];
 
 function runCli(file: string, args: string[], stdin = "") {
   return new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
@@ -33,6 +33,7 @@ test("official CLI pairs once, survives slow reasoning and daemon loss, retries 
   try { fs.unlinkSync(credential); } catch { /* absent is expected */ }
 
   let heartbeatCount = 0;
+  const heartbeatPhases: string[] = [];
   let lastHeartbeatSeq = 0;
   let actionCount = 0;
   let pairCount = 0;
@@ -63,7 +64,7 @@ test("official CLI pairs once, survives slow reasoning and daemon loss, retries 
     for await (const chunk of request) chunks.push(Buffer.from(chunk));
     const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown> : {};
     response.setHeader("content-type", "application/json");
-    if (request.url === "/api/agent-spec") return response.end(JSON.stringify({ ok: true, protocol: "mouju-agent/2.4", cli: { version: "1.3.0" } }));
+    if (request.url === "/api/agent-spec") return response.end(JSON.stringify({ ok: true, protocol: "mouju-agent/2.4", cli: { version: "1.4.0" } }));
     if (request.url === "/api/agent-pair") {
       pairCount += 1;
       assert.deepEqual((body.agent as { capabilities: string[] }).capabilities, CAPABILITIES);
@@ -72,6 +73,7 @@ test("official CLI pairs once, survives slow reasoning and daemon loss, retries 
     assert.equal(request.headers.authorization, `Bearer ${TOKEN}`);
     if (request.method === "GET" && request.url?.startsWith("/api/game?")) return response.end(JSON.stringify(view(actionCount ? 2 : 1)));
     if (request.url === "/api/agent-heartbeat") {
+      heartbeatPhases.push(String(body.reportedPhase));
       const seq = Number(body.seq);
       if (seq < lastHeartbeatSeq) {
         response.statusCode = 409;
@@ -141,6 +143,7 @@ test("official CLI pairs once, survives slow reasoning and daemon loss, retries 
   assert.match(daemonOutput, /"event":"paired"/, daemonErrors);
   assert.match(daemonOutput, /"event":"ready"/, daemonErrors);
   assert.match(daemonOutput, /"detached":true/, daemonErrors);
+  assert.match(daemonOutput, /"continuation":\{"required":true,"next":"next"/, daemonErrors);
   assert.ok(heartbeatCount >= 2);
   assert.doesNotMatch(daemonOutput + daemonErrors, new RegExp(TOKEN));
   assert.doesNotMatch(fs.readFileSync(descriptor, "utf8"), new RegExp(TOKEN));
@@ -152,11 +155,22 @@ test("official CLI pairs once, survives slow reasoning and daemon loss, retries 
   daemonPid = JSON.parse(fs.readFileSync(descriptor, "utf8")).pid;
   assert.doesNotThrow(() => process.kill(daemonPid!, 0), "the detached daemon survives launcher exit");
 
+  const unattendedDeadline = Date.now() + 2_000;
+  while (!heartbeatPhases.includes("unattended") && Date.now() < unattendedDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.ok(heartbeatPhases.includes("unattended"), "a heartbeat-only daemon explicitly reports that no decision consumer is attached");
+
   const status = await runCli(cli, ["status", "--room", ROOM]);
-  assert.equal(JSON.parse(status.stdout).ready, true);
+  const statusBody = JSON.parse(status.stdout);
+  assert.equal(statusBody.ready, true);
+  assert.equal(statusBody.phase, "unattended");
+  assert.equal(statusBody.decisionLoopActive, false);
+  assert.deepEqual(statusBody.continuation, { required: true, next: "next", reason: "match_not_terminal" });
   const next = await runCli(cli, ["next", "--room", ROOM, "--wait", "1"]);
   const visible = JSON.parse(next.stdout);
   assert.equal(visible.schema, "mouju-visible-state/1");
+  assert.deepEqual(visible.continuation, { required: true, next: "act", reason: "decision_ready" });
   assert.equal(visible.game.legalActions[0].id, "end");
   assert.equal(visible.game.deckCount, 71);
   assert.equal(visible.game.discardTop.name, "闪");
@@ -172,12 +186,15 @@ test("official CLI pairs once, survives slow reasoning and daemon loss, retries 
   const heartbeatBeforeSlowReasoning = heartbeatCount;
   await new Promise((resolve) => setTimeout(resolve, 5_200));
   assert.ok(heartbeatCount > heartbeatBeforeSlowReasoning, "heartbeat scheduling continues while the reasoning Agent is slow");
+  assert.equal(heartbeatPhases.at(-1), "planning", "only a live decision lease may advertise planning");
   const acted = await runCli(
     cli,
     ["act", "--room", ROOM],
     JSON.stringify({ legalId: "end", reason: "当前没有更优行动，保留手牌结束本回合。" }),
   );
-  assert.equal(JSON.parse(acted.stdout).receipt.reasonAccepted, true);
+  const actedBody = JSON.parse(acted.stdout);
+  assert.equal(actedBody.receipt.reasonAccepted, true);
+  assert.equal(actedBody.continuation.next, "next");
   assert.equal(actionCount, 1);
   assert.ok(Number(JSON.parse(fs.readFileSync(credential, "utf8")).seq) >= lastHeartbeatSeq, "the recovery capsule persists the last accepted heartbeat sequence");
 
@@ -190,8 +207,11 @@ test("official CLI pairs once, survives slow reasoning and daemon loss, retries 
   assert.equal(fallbackStatus.mode, "command_fallback");
   assert.equal(fallbackStatus.daemonAlive, false);
   assert.equal(fallbackStatus.ready, true);
+  assert.equal(fallbackStatus.phase, "unattended");
+  assert.equal(fallbackStatus.decisionLoopActive, false);
   const fallbackNext = JSON.parse((await runCli(cli, ["next", "--room", ROOM, "--wait", "1"])).stdout);
   assert.equal(fallbackNext.schema, "mouju-visible-state/1");
+  assert.equal(fallbackNext.continuation.next, "act");
   assert.equal("hand" in fallbackNext.players[1], false);
   const fallbackAct = JSON.parse((await runCli(
     cli,
@@ -200,6 +220,7 @@ test("official CLI pairs once, survives slow reasoning and daemon loss, retries 
   )).stdout);
   assert.equal(fallbackAct.mode, "command_fallback");
   assert.equal(fallbackAct.receipt.reasonAccepted, true);
+  assert.equal(fallbackAct.continuation.next, "next");
   assert.equal(actionCount, 2);
   assert.equal(submissionAttempts, 4, "fallback survives rate limiting and a lost success acknowledgement");
   assert.equal(pairCount, 1, "daemon recovery never consumes another pairing code");
@@ -213,6 +234,7 @@ test("official CLI pairs once, survives slow reasoning and daemon loss, retries 
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
   assert.equal(terminalStatus.stopReason, "stopped_by_owner");
+  assert.equal((terminalStatus.continuation as { required: boolean }).required, false);
   assert.equal(fs.existsSync(credential), false, "terminal stop removes the recovery credential");
   } finally {
     if (launcher?.exitCode == null) launcher?.kill("SIGTERM");
@@ -270,8 +292,8 @@ test("command fallback refuses a recovery credential that is readable by other O
   const descriptor = path.join(os.tmpdir(), `mouju-agent-${room}.json`);
   const credential = path.join(os.tmpdir(), `mouju-agent-${room}.credential.json`);
   fs.writeFileSync(cli, agentCliSource(), { mode: 0o700 });
-  fs.writeFileSync(descriptor, JSON.stringify({ cliVersion: "1.3.0", protocol: "mouju-agent/2.4", room, pid: 99999999, port: 1 }), { mode: 0o600 });
-  fs.writeFileSync(credential, JSON.stringify({ cliVersion: "1.3.0", protocol: "mouju-agent/2.4", origin: "http://127.0.0.1:1", room, token: TOKEN, controlEpoch: 1, seq: 0 }), { mode: 0o644 });
+  fs.writeFileSync(descriptor, JSON.stringify({ cliVersion: "1.4.0", protocol: "mouju-agent/2.4", room, pid: 99999999, port: 1 }), { mode: 0o600 });
+  fs.writeFileSync(credential, JSON.stringify({ cliVersion: "1.4.0", protocol: "mouju-agent/2.4", origin: "http://127.0.0.1:1", room, token: TOKEN, controlEpoch: 1, seq: 0 }), { mode: 0o644 });
   try {
     const result = await runCli(cli, ["status", "--room", room]);
     assert.notEqual(result.code, 0);
@@ -411,8 +433,8 @@ test("safe mode becomes an explicit terminal CLI state and deletes the recovery 
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const address = server.address();
   assert.ok(address && typeof address === "object");
-  fs.writeFileSync(descriptor, JSON.stringify({ cliVersion: "1.3.0", protocol: "mouju-agent/2.4", room, pid: 99999999, port: 1 }), { mode: 0o600 });
-  fs.writeFileSync(credential, JSON.stringify({ cliVersion: "1.3.0", protocol: "mouju-agent/2.4", origin: `http://127.0.0.1:${address.port}`, room, token: TOKEN, controlEpoch: 7, seq: 4 }), { mode: 0o600 });
+  fs.writeFileSync(descriptor, JSON.stringify({ cliVersion: "1.4.0", protocol: "mouju-agent/2.4", room, pid: 99999999, port: 1 }), { mode: 0o600 });
+  fs.writeFileSync(credential, JSON.stringify({ cliVersion: "1.4.0", protocol: "mouju-agent/2.4", origin: `http://127.0.0.1:${address.port}`, room, token: TOKEN, controlEpoch: 7, seq: 4 }), { mode: 0o600 });
   try {
     const result = await runCli(cli, ["status", "--room", room]);
     assert.equal(result.code, 0, result.stderr);
@@ -466,8 +488,8 @@ test("a CLI recovery process advances an expired decision without an open browse
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const address = server.address();
   assert.ok(address && typeof address === "object");
-  fs.writeFileSync(descriptor, JSON.stringify({ cliVersion: "1.3.0", protocol: "mouju-agent/2.4", room, pid: 99999999, port: 1 }), { mode: 0o600 });
-  fs.writeFileSync(credential, JSON.stringify({ cliVersion: "1.3.0", protocol: "mouju-agent/2.4", origin: `http://127.0.0.1:${address.port}`, room, token: TOKEN, controlEpoch: 5, seq: 3 }), { mode: 0o600 });
+  fs.writeFileSync(descriptor, JSON.stringify({ cliVersion: "1.4.0", protocol: "mouju-agent/2.4", room, pid: 99999999, port: 1 }), { mode: 0o600 });
+  fs.writeFileSync(credential, JSON.stringify({ cliVersion: "1.4.0", protocol: "mouju-agent/2.4", origin: `http://127.0.0.1:${address.port}`, room, token: TOKEN, controlEpoch: 5, seq: 3 }), { mode: 0o600 });
   try {
     const result = await runCli(cli, ["status", "--room", room]);
     assert.equal(result.code, 0, result.stderr);
