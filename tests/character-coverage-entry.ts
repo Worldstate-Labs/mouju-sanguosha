@@ -1,5 +1,6 @@
 import "./game-v2-standard.test.ts";
 import "./game-v2-branch-closure.test.ts";
+import "./game-v2-state-space.test.ts";
 import "./character-system-audit.test.ts";
 import "./character-locked-lord-edge.test.ts";
 import "./character-trigger-edge.test.ts";
