@@ -1,0 +1,50 @@
+{
+  "name": "mouju-sanguosha",
+  "version": "0.1.0",
+  "private": true,
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "install:ci": "bash scripts/install-ci.sh",
+    "dev": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vite",
+    "build": "bash scripts/build-verified.sh",
+    "start": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext start",
+    "test": "npm run build && node --experimental-strip-types --test tests/rendered-html.test.mjs tests/ux-contract.test.mjs tests/game-engine.test.ts tests/standard-ruleset-data.test.ts tests/agent-protocol.test.ts tests/agent-cli.test.ts tests/card-catalog.test.ts && npm run test:v2 && npm run test:characters:audit && npm run test:store",
+    "test:v2": "esbuild tests/game-v2-standard.test.ts --bundle --platform=node --format=esm --outfile=/tmp/mouju-game-v2-standard.test.mjs --log-level=warning && node --test /tmp/mouju-game-v2-standard.test.mjs",
+    "test:characters:audit": "esbuild tests/character-system-audit.test.ts tests/character-locked-lord-edge.test.ts tests/character-trigger-edge.test.ts tests/action-presentation.test.ts --bundle --platform=node --format=esm --outdir=/tmp/mouju-character-audit --out-extension:.js=.mjs --log-level=warning && node --test /tmp/mouju-character-audit/*.test.mjs",
+    "test:characters:chaos": "esbuild tests/character-chaos.test.ts --bundle --platform=node --format=esm --outfile=/tmp/mouju-character-chaos.test.mjs --log-level=warning && node --test /tmp/mouju-character-chaos.test.mjs",
+    "test:store": "esbuild tests/store-agent-control.test.ts --bundle --platform=node --format=esm --outfile=/tmp/mouju-store-agent-control.test.mjs --log-level=warning && node --test /tmp/mouju-store-agent-control.test.mjs && esbuild tests/four-agent-match.test.ts --bundle --platform=node --format=esm --outfile=/tmp/mouju-four-agent-match.test.mjs --log-level=warning && node --test /tmp/mouju-four-agent-match.test.mjs",
+    "validate:artifact": "bash scripts/validate-artifact.sh",
+    "lint": "bash scripts/sites-env.sh -- eslint . --ignore-pattern dist --ignore-pattern .next",
+    "db:generate": "bash scripts/sites-env.sh -- drizzle-kit generate"
+  },
+  "dependencies": {
+    "@supabase/ssr": "0.12.0",
+    "@supabase/supabase-js": "2.110.2",
+    "drizzle-orm": "0.45.2",
+    "next": "16.2.6",
+    "react": "19.2.6",
+    "react-dom": "19.2.6"
+  },
+  "devDependencies": {
+    "@cloudflare/vite-plugin": "1.37.1",
+    "@tailwindcss/postcss": "4.2.1",
+    "@types/node": "22.19.19",
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "6.0.2",
+    "@vitejs/plugin-rsc": "0.5.26",
+    "drizzle-kit": "0.31.10",
+    "eslint": "9.39.4",
+    "eslint-config-next": "16.2.6",
+    "react-server-dom-webpack": "19.2.6",
+    "tailwindcss": "4.2.1",
+    "typescript": "5.9.3",
+    "vinext": "0.0.50",
+    "vite": "8.0.13",
+    "wrangler": "4.92.0"
+  },
+  "type": "module",
+  "displayName": "谋局·三国杀"
+}

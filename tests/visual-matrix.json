@@ -1,0 +1,27 @@
+{
+  "viewports": [
+    { "name": "desktop-wide", "width": 1440, "height": 900 },
+    { "name": "desktop-short", "width": 1280, "height": 720 },
+    { "name": "tablet-landscape", "width": 932, "height": 430 },
+    { "name": "mobile-standard", "width": 390, "height": 844 },
+    { "name": "mobile-compact", "width": 360, "height": 640 }
+  ],
+  "states": [
+    "lobby-human",
+    "lobby-agent-pairing",
+    "game-idle",
+    "game-target-selection",
+    "game-agent-owner",
+    "game-public-zones",
+    "game-battle-log",
+    "game-result-recap"
+  ],
+  "contracts": [
+    "hand-and-action-dock-never-overlap",
+    "agent-latest-reason-visible-without-console-scroll",
+    "agent-history-scrolls-independently",
+    "public-target-animation-uses-only-public-log-metadata",
+    "result-recap-is-viewport-scroll-safe",
+    "touch-controls-have-44px-hit-targets"
+  ]
+}

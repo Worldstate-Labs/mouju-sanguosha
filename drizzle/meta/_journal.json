@@ -1,0 +1,27 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "6",
+      "when": 1783655832500,
+      "tag": "0000_narrow_madame_hydra",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1783659729932,
+      "tag": "0001_serious_terror",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1783672157748,
+      "tag": "0002_romantic_iron_lad",
+      "breakpoints": true
+    }
+  ]
+}
