@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { DatabaseSync } from "node:sqlite";
 import { runWithBindings } from "../lib/runtime-env.ts";
+import { applyGameActionV2, getLegalActionsV2, type GameStateV2 } from "../lib/game-v2.ts";
+import { STANDARD_CHARACTERS } from "../lib/game-v2-data.ts";
 import {
   ApiError,
   claimAgentPairing,
@@ -285,6 +287,78 @@ function assertPrivateProjection(view: TestView, allTokens: string[], allPairing
   assert.equal(serialized.includes("rngMode"), false, "internal RNG mode is never projected");
   for (const secret of [...allTokens, ...allPairingCodes]) assert.equal(serialized.includes(secret), false);
 }
+
+test("skill-private pending payloads stay server-side while the owning Agent gets only its legal choice", async () => {
+  const d1 = new MockD1();
+  await runWithBindings({ DB: d1 as never }, async () => {
+    const setup = await setupAgentLobby(d1);
+    await handleOperation(request(setup.owners[0]), { op: "start", room: setup.room });
+    const row = d1.sqlite.prepare("SELECT state_json FROM rooms WHERE code = ?").get(setup.room) as { state_json: string };
+    let game = JSON.parse(row.state_json) as GameStateV2;
+    for (let guard = 0; game.status === "setup" && guard < 100; guard += 1) {
+      const actorId = game.pending!.actorId;
+      const option = getLegalActionsV2(game, actorId)[0];
+      game = applyGameActionV2(game, actorId, option.action!, { nowMs: 10 + guard });
+    }
+    assert.equal(game.status, "playing");
+
+    const ownerId = setup.pairings[0].playerId;
+    const ownerPlayer = game.players.find((entry) => entry.id === ownerId)!;
+    ownerPlayer.character = STANDARD_CHARACTERS.find((entry) => entry.id === "guojia")!;
+    ownerPlayer.maxHp = ownerPlayer.character.maxHp;
+    ownerPlayer.hp = ownerPlayer.maxHp;
+    const yijiCards = [game.deck.pop()!, game.deck.pop()!];
+    game.revealed.push(...yijiCards);
+    game.stack = [];
+    game.pending = {
+      id: "private-yiji",
+      kind: "yijiAssign",
+      actorId: ownerId,
+      prompt: "遗计：请分配两张牌",
+      data: { cardIds: yijiCards.map((card) => card.id) },
+    };
+    d1.sqlite.prepare("UPDATE rooms SET state_json = ? WHERE code = ?").run(JSON.stringify(game), setup.room);
+
+    const [controller, owner, opponent] = await Promise.all([
+      getRoom(request(setup.tokens[0]), setup.room),
+      getRoom(request(setup.owners[0]), setup.room),
+      getRoom(request(setup.tokens[1]), setup.room),
+    ]) as [TestView, TestView, TestView];
+    assert.deepEqual(controller.players.find((entry) => entry.id === ownerId), owner.players.find((entry) => entry.id === ownerId));
+    assert.deepEqual(controller.game?.pending, owner.game?.pending);
+    assert.deepEqual(controller.game?.pending, opponent.game?.pending);
+    assert.equal("data" in (controller.game!.pending as unknown as Record<string, unknown>), false);
+    assert.ok(controller.game!.legalActions.some((entry) => JSON.stringify(entry).includes(yijiCards[0].id)));
+    assert.equal(owner.game!.legalActions.length, 0, "delegated owner cannot race the Agent controller");
+    assert.equal(opponent.game!.legalActions.length, 0);
+    for (const secret of yijiCards.map((card) => card.id)) {
+      assert.equal(JSON.stringify(owner).includes(secret), false, "Yiji option IDs are not exposed outside the current controller action list");
+      assert.equal(JSON.stringify(opponent).includes(secret), false, "opponents never receive Yiji revealed-card IDs");
+    }
+
+    const targetId = setup.pairings[1].playerId;
+    const committedCardId = ownerPlayer.hand[0].id;
+    game.revealed = game.revealed.filter((card) => !yijiCards.some((secret) => secret.id === card.id));
+    game.deck.push(...yijiCards);
+    game.pending = {
+      id: "private-fanjian",
+      kind: "chooseSuit",
+      actorId: targetId,
+      prompt: "反间：请选择一种花色",
+      data: { sourceId: ownerId, committedCardId },
+    };
+    d1.sqlite.prepare("UPDATE rooms SET state_json = ? WHERE code = ?").run(JSON.stringify(game), setup.room);
+    const [target, bystander] = await Promise.all([
+      getRoom(request(setup.tokens[1]), setup.room),
+      getRoom(request(setup.tokens[2]), setup.room),
+    ]) as [TestView, TestView];
+    assert.equal(target.game!.legalActions.length, 4);
+    assert.ok(target.game!.legalActions.every((entry) => entry.action?.type === "choose" && typeof entry.action.suit === "string"));
+    assert.equal(JSON.stringify(target).includes(committedCardId), false, "Fanjian target cannot inspect the committed card before naming a suit");
+    assert.equal(JSON.stringify(bystander).includes(committedCardId), false, "Fanjian committed card stays hidden from other seats");
+    assert.equal("data" in (target.game!.pending as unknown as Record<string, unknown>), false);
+  });
+});
 
 test("four participant-owned Agents connect concurrently and finish a complete four-player match", async () => {
   const d1 = new MockD1();

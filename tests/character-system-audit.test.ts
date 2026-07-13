@@ -4,12 +4,14 @@ import {
   applyGameActionV2,
   assertGameInvariantV2,
   createGameV2,
+  EFFECT_FRAME_KINDS_V2,
   getLegalActionsV2,
+  PENDING_KINDS_V2,
   type GameActionV2,
   type GameStateV2,
   type LegalActionV2,
 } from "../lib/game-v2.ts";
-import { SKILLS, STANDARD_CHARACTERS, type LobbySeat, type SkillId } from "../lib/game-v2-data.ts";
+import { SKILLS, STANDARD_CHARACTERS, kingdomName, type LobbySeat, type SkillId } from "../lib/game-v2-data.ts";
 
 type SkillClass = "active" | "conversion" | "trigger" | "locked" | "lord";
 
@@ -75,6 +77,14 @@ function preferred(actions: LegalActionV2[]) {
 test("the executable character audit manifest covers every declared general and skill", () => {
   assert.equal(STANDARD_CHARACTERS.length, 25);
   assert.equal(Object.keys(SKILLS).length, 40);
+  assert.equal(PENDING_KINDS_V2.length, 34);
+  assert.equal(new Set(PENDING_KINDS_V2).size, PENDING_KINDS_V2.length);
+  assert.equal(EFFECT_FRAME_KINDS_V2.length, 20);
+  assert.equal(new Set(EFFECT_FRAME_KINDS_V2).size, EFFECT_FRAME_KINDS_V2.length);
+  assert.deepEqual(
+    (["wei", "shu", "wu", "qun"] as const).map((kingdom) => kingdomName(kingdom)),
+    ["魏", "蜀", "吴", "群"],
+  );
   assert.deepEqual(new Set(Object.keys(SKILL_CLASSES)), new Set(Object.keys(SKILLS)));
   for (const general of STANDARD_CHARACTERS) {
     assert.ok(general.skills.length > 0, `${general.name} has no declared skill`);

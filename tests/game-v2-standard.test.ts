@@ -110,6 +110,13 @@ test("classic identity setup supports 4 through 10 seats and preserves all 108 c
   }
 });
 
+test("game creation rejects unsupported seat counts and malformed physical-card ID sets", () => {
+  assert.throws(() => createGameV2(seats(3), { seed: 9001 }), /2 人对决或 4–10 人身份局/);
+  assert.throws(() => createGameV2(seats(11), { seed: 9002 }), /2 人对决或 4–10 人身份局/);
+  assert.throws(() => createGameV2(seats(4), { seed: 9003, cardIds: Array.from({ length: 107 }, (_, index) => `short-${index}`) }), /覆盖整副牌/);
+  assert.throws(() => createGameV2(seats(4), { seed: 9004, cardIds: Array.from({ length: 108 }, () => "duplicate") }), /保持唯一/);
+});
+
 test("classic KOF duel drafts five, secretly lines up three, and applies the first-turn draw handicap", () => {
   const initial = createGameV2(seats(2), { seed: 202 }, { nowMs: 1 });
   assert.equal(initial.mode, "duel");
@@ -148,6 +155,19 @@ test("state invariants reject silent corruption while permitting the bounded dyi
   const overhealed = structuredClone(healthy);
   overhealed.players[0].hp = overhealed.players[0].maxHp + 1;
   assert.throws(() => assertGameInvariantV2(overhealed), /体力越界/);
+
+  const invalidPlayerCount = structuredClone(healthy);
+  const removed = invalidPlayerCount.players.pop()!;
+  invalidPlayerCount.discard.push(
+    ...removed.hand,
+    ...Object.values(removed.equipment).filter((card): card is Card => Boolean(card)),
+    ...removed.judgment,
+  );
+  assert.throws(() => assertGameInvariantV2(invalidPlayerCount), /玩家数量/);
+
+  const mismatchedAlive = structuredClone(healthy);
+  mismatchedAlive.players[1].alive = false;
+  assert.throws(() => assertGameInvariantV2(mismatchedAlive), /存活状态与体力不一致/);
 
   const dying = structuredClone(healthy);
   const target = dying.players[1];

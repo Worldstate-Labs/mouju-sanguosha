@@ -19,6 +19,26 @@ import {
 
 export type TurnPhase = "prepare" | "judge" | "draw" | "play" | "discard" | "finish";
 
+export const PENDING_KINDS_V2 = [
+  "borrowSha", "chooseBorrowTarget", "chooseCharacter", "chooseSuit", "chooseZoneCard",
+  "cixiong", "cixiongChoice", "damageTrigger", "discardPhase", "drawChoice", "duelColor",
+  "duelDraft", "duelLineup", "fankui", "ganglieChoice", "guanshi", "guanxing", "hanbing",
+  "hanbingChoice", "harvest", "judgment", "liuli", "lordRequest", "lossTrigger",
+  "luoshenContinue", "nullification", "optionalSkill", "qilin", "qinglong", "rescue",
+  "response", "tiandu", "tieqi", "yijiAssign",
+] as const;
+
+export type PendingKindV2 = (typeof PENDING_KINDS_V2)[number];
+
+export const EFFECT_FRAME_KINDS_V2 = [
+  "afterDamage", "applyCardEffect", "continueHanbing", "continueNullification",
+  "continueResponse", "damage", "death", "discardPhase", "drawPhase", "dying", "endTurn",
+  "enterPhase", "finishPhase", "finishUse", "judgePhase", "postShaDamage", "preparePhase",
+  "resolveDelayed", "resolveTarget", "resolveUse",
+] as const;
+
+export type EffectFrameKindV2 = (typeof EFFECT_FRAME_KINDS_V2)[number];
+
 export interface EquipmentState {
   weapon: Card | null;
   armor: Card | null;
@@ -73,7 +93,7 @@ export interface TurnStateV2 {
 
 export interface PendingDecisionV2 {
   id: string;
-  kind: string;
+  kind: PendingKindV2;
   actorId: string;
   prompt: string;
   data: Record<string, unknown>;
@@ -81,7 +101,7 @@ export interface PendingDecisionV2 {
 
 export interface EffectFrameV2 {
   id: string;
-  kind: string;
+  kind: EffectFrameKindV2;
   step: number;
   data: Record<string, unknown>;
 }
@@ -115,6 +135,7 @@ export interface GameStateV2 {
   duelFirstPlayerId?: string;
   duelFirstDrawPending?: boolean;
   duelTurnTerminated?: boolean;
+  turnTerminated?: boolean;
   status: "setup" | "playing" | "finished";
   players: GamePlayerV2[];
   deck: Card[];
@@ -277,7 +298,13 @@ function alivePlayers(state: GameStateV2) {
 function actionOrder(state: GameStateV2, startingId: string, includeStarting = true) {
   const alive = alivePlayers(state);
   const start = alive.findIndex((entry) => entry.id === startingId);
-  if (start < 0) return alive;
+  if (start < 0) {
+    const origin = state.players.find((entry) => entry.id === startingId);
+    if (!origin || alive.length === 0) return alive;
+    const next = alive.findIndex((entry) => entry.seat > origin.seat);
+    const index = next >= 0 ? next : 0;
+    return [...alive.slice(index), ...alive.slice(0, index)];
+  }
   const offset = includeStarting ? 0 : 1;
   return Array.from({ length: alive.length - (includeStarting ? 0 : 1) }, (_, index) => alive[(start + index + offset) % alive.length]);
 }
@@ -404,14 +431,14 @@ function draw(state: GameStateV2, targetId: string, count: number, context?: Eng
   }
 }
 
-function pushFrame(state: GameStateV2, kind: string, data: Record<string, unknown> = {}) {
+function pushFrame(state: GameStateV2, kind: EffectFrameKindV2, data: Record<string, unknown> = {}) {
   state.frameSeq += 1;
   state.stack.push({ id: `f${state.frameSeq}`, kind, step: 0, data });
 }
 
 function setPending(
   state: GameStateV2,
-  kind: string,
+  kind: PendingKindV2,
   actorId: string,
   prompt: string,
   data: Record<string, unknown> = {},
@@ -662,6 +689,7 @@ export function createGameV2(
     schemaVersion: 2,
     rulesetId: "classic-standard-2009-ex",
     mode,
+    turnTerminated: false,
     status: "setup",
     players: [],
     deck: [],
@@ -761,6 +789,8 @@ function handleChooseCharacter(
 
 function beginTurn(state: GameStateV2, targetId: string, context?: EngineContextV2) {
   const target = player(state, targetId);
+  state.turnTerminated = false;
+  state.duelTurnTerminated = false;
   state.turn = {
     playerId: target.id,
     phase: "prepare",
@@ -904,7 +934,9 @@ function processDiscardPhase(state: GameStateV2) {
 
 function processFinishPhase(state: GameStateV2) {
   const target = player(state, state.turn!.playerId);
-  if (hasSkill(target, "biyue") && !state.turn!.usedSkills.includes("biyue")) {
+  if (hasSkill(target, "biyue")
+    && !state.turn!.usedSkills.includes("biyue")
+    && !state.turn!.usedSkills.includes("biyue:phase")) {
     setPending(state, "optionalSkill", target.id, "是否发动【闭月】摸一张牌？", { skill: "biyue", resume: "finish" });
     return;
   }
@@ -928,14 +960,18 @@ function advance(state: GameStateV2, context?: EngineContextV2) {
     }
     const frame = state.stack.pop();
     if (!frame) {
-      if (state.mode === "duel" && state.duelTurnTerminated && state.turn) {
+      if ((state.turnTerminated || state.duelTurnTerminated) && state.turn) {
+        state.turnTerminated = false;
         state.duelTurnTerminated = false;
         const current = player(state, state.turn.playerId);
-        const opponent = alivePlayers(state).find((entry) => entry.id !== current.id);
-        if (opponent) {
-          if (opponent.seat <= current.seat) state.round += 1;
+        const living = alivePlayers(state);
+        const next = state.mode === "duel"
+          ? living.find((entry) => entry.id !== current.id)
+          : living.find((entry) => entry.seat > current.seat) ?? living[0];
+        if (next) {
+          if (next.seat <= current.seat) state.round += 1;
           addLog(state, `${current.name} 的回合因武将阵亡结束。`, "system", context);
-          beginTurn(state, opponent.id, context);
+          beginTurn(state, next.id, context);
           continue;
         }
       }
@@ -988,9 +1024,6 @@ function zoneHasCards(target: GamePlayerV2, includeJudgment = true) {
 function validSingleTargets(state: GameStateV2, source: GamePlayerV2, name: StandardCardName) {
   const others = alivePlayers(state).filter((target) => !cannotTarget(state, source, target, name));
   if (name === "杀") return others.filter((target) => distanceV2(state, source.id, target.id) <= attackRangeV2(source));
-  if (name === "顺手牵羊") {
-    return others.filter((target) => zoneHasCards(target) && (hasSkill(source, "qicai") || distanceV2(state, source.id, target.id) <= 1));
-  }
   if (name === "过河拆桥") return others.filter((target) => zoneHasCards(target));
   if (name === "决斗" || name === "乐不思蜀") return others;
   if (name === "借刀杀人") return others.filter((target) => Boolean(target.equipment.weapon)
@@ -1050,7 +1083,7 @@ function cardPlayActions(state: GameStateV2, actor: GamePlayerV2) {
             actions.push(exact(
               `play:${card.id}:fangtian:${group.map((target) => target.id).join(":")}`,
               `【方天画戟】对 ${group.map((target) => target.name).join("、")} 使用【杀】`,
-              { type: "playCard", cardId: card.id, targetIds: group.map((target) => target.id), as: "杀", skill: "fangtian" },
+              { type: "playCard", cardId: card.id, targetIds: group.map((target) => target.id), as: "杀", skill: option.skill ?? "fangtian" },
             ));
           }
         }
@@ -1065,7 +1098,9 @@ function cardPlayActions(state: GameStateV2, actor: GamePlayerV2) {
       }
     }
   }
-  if (actor.equipment.weapon?.name === "丈八蛇矛" && actor.hand.length >= 2) {
+  if (actor.equipment.weapon?.name === "丈八蛇矛"
+    && actor.hand.length >= 2
+    && (state.turn!.shaUsed < 1 || hasSkill(actor, "paoxiao"))) {
     const targets = validSingleTargets(state, actor, "杀").map((target) => target.id);
     if (targets.length > 0) {
       actions.push({
@@ -1286,7 +1321,22 @@ function publicCardList(cards: Card[]) {
 }
 
 function sameAction(left: GameActionV2, right: GameActionV2) {
-  return JSON.stringify(left) === JSON.stringify(right);
+  const canonicalize = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(canonicalize);
+    if (value && typeof value === "object") {
+      return Object.fromEntries(
+        Object.entries(value as Record<string, unknown>)
+          .filter(([, entry]) => entry !== undefined)
+          .sort(([leftKey], [rightKey]) => leftKey.localeCompare(rightKey))
+          .map(([key, entry]) => [key, canonicalize(entry)]),
+      );
+    }
+    return value;
+  };
+  const semantic = (action: GameActionV2) => Object.fromEntries(
+    Object.entries(action).filter(([key]) => key !== "decisionId" && key !== "optionId"),
+  );
+  return JSON.stringify(canonicalize(semantic(left))) === JSON.stringify(canonicalize(semantic(right)));
 }
 
 function validateSubmission(state: GameStateV2, actorId: string, action: GameActionV2) {
@@ -1296,6 +1346,8 @@ function validateSubmission(state: GameStateV2, actorId: string, action: GameAct
   const template = legal.find((entry) => entry.kind !== "exact" && entry.skill === action.skill)
     ?? legal.find((entry) => entry.kind === "discard" && action.type === "discard");
   if (!template) throw new Error("该动作不在当前服务器合法动作中");
+  const expectedType = template.kind === "skill" ? "skill" : template.kind;
+  if (action.type !== expectedType) throw new Error("动作类型不合法");
   const cards = [...new Set(action.cardIds ?? [])];
   const targets = [...new Set(action.targetIds ?? (action.targetId ? [action.targetId] : []))];
   if (cards.length !== (action.cardIds ?? []).length || targets.length !== (action.targetIds ?? (action.targetId ? [action.targetId] : [])).length) {
@@ -1409,7 +1461,7 @@ function resolveOptionalSkill(state: GameStateV2, actor: GamePlayerV2, action: G
   if (data.skill === "bagua") {
     if (action.type === "pass") {
       const source = player(state, data.use!.sourceId);
-      const required = hasSkill(source, "wushuang") ? 2 : 1;
+      const required = source.alive && hasSkill(source, "wushuang") ? 2 : 1;
       setPending(state, "response", actor.id, `请打出${required > 1 ? "两张" : ""}【闪】`, {
         required: "闪", remaining: required, use: data.use, targetId: actor.id, kind: "sha", baguaTried: true,
       });
@@ -1418,7 +1470,7 @@ function resolveOptionalSkill(state: GameStateV2, actor: GamePlayerV2, action: G
   }
   if (action.type === "pass") {
     state.turn!.usedSkills.push(`${data.skill}:phase`);
-    pushFrame(state, `${data.resume}Phase`);
+    pushFrame(state, `${data.resume as "prepare" | "discard" | "finish"}Phase`);
     return;
   }
   if (data.skill === "biyue") {
@@ -1477,6 +1529,11 @@ function beginGuanxing(state: GameStateV2, actor: GamePlayerV2, context?: Engine
     recycleDeck(state, context);
     const card = state.deck.pop();
     if (card) cards.push(card);
+  }
+  if (cards.length === 0) {
+    addLog(state, `${actor.name} 发动【观星】，但牌堆与弃牌堆均无牌。`, "normal", context);
+    pushFrame(state, "preparePhase");
+    return;
   }
   state.revealed.push(...cards);
   setPending(state, "guanxing", actor.id, "观星：依次选择牌与放置位置", {
@@ -1570,7 +1627,15 @@ function startVirtualSha(state: GameStateV2, actor: GamePlayerV2, ids: string[],
   state.turn!.shaUsed += 1;
   state.turn!.stats.shaUsedOrPlayed = true;
   pushFrame(state, "resolveUse", { use });
-  addLog(state, `${actor.name} 发动【丈八蛇矛】，对 ${player(state, targetId).name} 使用【杀】。`, "normal", context);
+  addLog(state, `${actor.name} 发动【丈八蛇矛】，将 ${publicCardList(cards)} 当【杀】对 ${player(state, targetId).name} 使用。`, "normal", context, {
+    kind: "use",
+    actorId: actor.id,
+    sourceId: actor.id,
+    targetIds: [targetId],
+    cardName: "杀",
+    cardNames: cards.map((card) => card.name),
+    count: cards.length,
+  });
 }
 
 function startCardUse(state: GameStateV2, actor: GamePlayerV2, action: GameActionV2, context?: EngineContextV2) {
@@ -1599,12 +1664,23 @@ function startCardUse(state: GameStateV2, actor: GamePlayerV2, action: GameActio
     state.turn!.stats.shaUsedOrPlayed = true;
   }
   const sourceSkillName = action.skill ? SKILLS[action.skill as SkillId]?.name : undefined;
-  addLog(state, `${actor.name}${sourceSkillName ? ` 发动【${sourceSkillName}】，` : " "}使用【${name}】${targets.length === 1 && targets[0] !== actor.id ? `，目标是 ${player(state, targets[0]).name}` : ""}。`, "normal", context, {
+  const fangtianMultiTarget = name === "杀"
+    && targets.length > 1
+    && actor.equipment.weapon?.name === "方天画戟";
+  const usePrefix = fangtianMultiTarget
+    ? sourceSkillName
+      ? ` 发动【方天画戟】并发动【${sourceSkillName}】，将 ${publicCardLabel(physical)} 当`
+      : " 发动【方天画戟】，使用"
+    : sourceSkillName
+      ? ` 发动【${sourceSkillName}】，将 ${publicCardLabel(physical)} 当`
+      : " 使用";
+  addLog(state, `${actor.name}${usePrefix}【${name}】${targets.length === 1 && targets[0] !== actor.id ? `，目标是 ${player(state, targets[0]).name}` : ""}。`, "normal", context, {
     kind: ["南蛮入侵", "万箭齐发", "桃园结义", "五谷丰登"].includes(name) ? "aoe" : "use",
     actorId: actor.id,
     sourceId: actor.id,
     targetIds: targets,
     cardName: name,
+    ...(sourceSkillName ? { cardNames: [physical.name] } : {}),
     count: 1,
   });
   const virtualCategory = CARD_METADATA[name].category;
@@ -1965,7 +2041,11 @@ function resolveLordRequest(state: GameStateV2, actor: GamePlayerV2, action: Gam
   const cards = removeOwnedCardsTracked(state, actor, ids).map((entry) => entry.card);
   const lord = player(state, data.lordId);
   const providedName = data.skill === "hujia" ? "闪" : "杀";
-  const providerSkillName = action.skill && action.skill in SKILLS ? SKILLS[action.skill as SkillId].name : undefined;
+  const providerSkillName = action.skill === "lord_zhangba"
+    ? "丈八蛇矛"
+    : action.skill && action.skill in SKILLS
+      ? SKILLS[action.skill as SkillId].name
+      : undefined;
   addLog(state, `${actor.name}${providerSkillName ? ` 发动【${providerSkillName}】，将 ${publicCardList(cards)} 当【${providedName}】` : ` 使用 ${publicCardList(cards)}`}为 ${lord.name} 响应【${data.skill === "hujia" ? "护驾" : "激将"}】。`, "good", context, { kind: "respond", actorId: actor.id, sourceId: actor.id, targetIds: [lord.id], cardName: providedName, cardNames: cards.map((card) => card.name), count: cards.length });
   if (data.mode === "play") {
     state.processing.push(...cards);
@@ -2078,7 +2158,11 @@ function resolveResponseDecision(state: GameStateV2, actor: GamePlayerV2, action
   state.turn!.stats.shaUsedOrPlayed ||= data.required === "杀"
     && state.turn?.phase === "play"
     && state.turn.playerId === actor.id;
-  const responseSkillName = action.skill ? SKILLS[action.skill as SkillId]?.name : undefined;
+  const responseSkillName = action.skill === "zhangba_response"
+    ? "丈八蛇矛"
+    : action.skill
+      ? SKILLS[action.skill as SkillId]?.name
+      : undefined;
   addLog(state, `${actor.name}${responseSkillName ? ` 发动【${responseSkillName}】，将 ${publicCardList(physicalCards)} 当【${data.required}】打出。` : ` 打出 ${publicCardList(physicalCards)}。`}`, "good", context, { kind: "respond", actorId: actor.id, targetIds: [actor.id], cardName: data.required, cardNames: physicalCards.map((card) => card.name), count: physicalCards.length });
   completeResponse(state, actor.id, data, context);
 }
@@ -2092,7 +2176,11 @@ function completeResponse(
   const responder = player(state, responderId);
   const remaining = data.remaining - 1;
   if (remaining > 0) {
-    pushFrame(state, "continueResponse", { actorId: responder.id, prompt: `还需打出 ${remaining} 张【${data.required}】`, data: { ...data, remaining, lordSkillTried: false } });
+    pushFrame(state, "continueResponse", {
+      actorId: responder.id,
+      prompt: `还需打出 ${remaining} 张【${data.required}】`,
+      data: { ...data, remaining, lordSkillTried: false, baguaTried: false },
+    });
     return;
   }
   if (data.kind === "duel") {
@@ -2316,27 +2404,77 @@ function applyJudgmentOutcome(
 ) {
   const card = findCardEverywhere(state, judgment.cardId);
   const continuation = dataAs<{ resume: string; cardIds?: string[]; use?: CardUse; targetId?: string }>(judgment.continuation);
-  if (!card) {
-    // 天妒已获得实体牌；结算仍使用已记录的花色点数快照。
-    const obtained = player(state, judgment.targetId).hand.find((entry) => entry.id === judgment.cardId);
-    if (!obtained) throw new Error("判定牌丢失");
-    applyJudgmentWithCard(state, judgment, continuation, obtained, context);
-  } else applyJudgmentWithCard(state, judgment, continuation, card, context);
+  if (!card) throw new Error("判定牌丢失");
+  applyJudgmentWithCard(state, judgment, continuation, card, context);
+}
+
+type JudgmentContinuation = {
+  resume: string;
+  cardIds?: string[];
+  use?: CardUse;
+  targetId?: string;
+  sourceId?: string;
+  ownerId?: string;
+  lordRequest?: LordRequestData;
+  responseData?: { required: "杀" | "闪"; remaining: number; use: CardUse; targetId: string; kind: string; opponentId?: string };
+};
+
+function continueWithoutJudgment(
+  state: GameStateV2,
+  targetId: string,
+  reason: string,
+  continuation: JudgmentContinuation,
+  context?: EngineContextV2,
+) {
+  addLog(state, `${player(state, targetId).name} 的【${reason}】没有可用判定牌，按判定失败继续结算。`, "normal", context);
+  if (continuation.resume === "luoshen" || continuation.resume === "ganglie") return;
+  if (continuation.resume === "indulgence") {
+    discardProcessing(state, continuation.cardIds ?? []);
+    pushFrame(state, "judgePhase");
+    return;
+  }
+  if (continuation.resume === "lightning") {
+    const cardId = continuation.cardIds?.[0];
+    if (cardId) passLightning(state, cardId, targetId);
+    else pushFrame(state, "judgePhase");
+    return;
+  }
+  if (continuation.resume === "tieqi") {
+    pushFrame(state, "applyCardEffect", { use: continuation.use!, targetId: continuation.targetId! });
+    return;
+  }
+  if (continuation.resume === "hujiaBagua") {
+    continueLordRequest(state, continuation.lordRequest!);
+    return;
+  }
+  if (continuation.resume === "responseBagua") {
+    setPending(state, "response", targetId, "【八卦阵】无可用判定牌，请使用手牌响应", {
+      ...continuation.responseData!,
+      baguaTried: true,
+    });
+    return;
+  }
+  if (continuation.resume === "bagua") {
+    const use = continuation.use!;
+    const source = player(state, use.sourceId);
+    const required = source.alive && hasSkill(source, "wushuang") ? 2 : 1;
+    setPending(state, "response", targetId, `请打出${required > 1 ? "两张" : ""}【闪】`, {
+      required: "闪",
+      remaining: required,
+      use,
+      targetId,
+      kind: "sha",
+      baguaTried: true,
+    });
+    return;
+  }
+  throw new Error(`未知无牌判定续接：${continuation.resume}`);
 }
 
 function applyJudgmentWithCard(
   state: GameStateV2,
   judgment: { targetId: string; reason: string; cardId: string },
-  continuation: {
-    resume: string;
-    cardIds?: string[];
-    use?: CardUse;
-    targetId?: string;
-    sourceId?: string;
-    ownerId?: string;
-    lordRequest?: LordRequestData;
-    responseData?: { required: "杀" | "闪"; remaining: number; use: CardUse; targetId: string; kind: string; opponentId?: string };
-  },
+  continuation: JudgmentContinuation,
   card: Card,
   context?: EngineContextV2,
 ) {
@@ -2351,7 +2489,6 @@ function applyJudgmentWithCard(
       setPending(state, "luoshenContinue", judgment.targetId, "洛神判定为黑色，是否继续？", {});
     } else {
       discardJudge();
-      pushFrame(state, "preparePhase");
     }
     return;
   }
@@ -2367,9 +2504,20 @@ function applyJudgmentWithCard(
     const hit = card.suit === "spade" && rank >= 2 && rank <= 9;
     discardJudge();
     if (hit) {
-      discardProcessing(state, continuation.cardIds ?? []);
       pushFrame(state, "judgePhase");
-      queueDamage(state, { targetId: judgment.targetId, amount: 3, cardIds: continuation.cardIds ?? [], cardName: "闪电", reason: "【闪电】" });
+      const lightningIds = continuation.cardIds ?? [];
+      pushFrame(state, "finishUse", {
+        use: {
+          id: `lightning:${judgment.cardId}`,
+          sourceId: judgment.targetId,
+          name: "闪电",
+          cardIds: lightningIds,
+          color: "none",
+          targets: [judgment.targetId],
+          targetIndex: 1,
+        } satisfies CardUse,
+      });
+      queueDamage(state, { targetId: judgment.targetId, amount: 3, cardIds: lightningIds, cardName: "闪电", reason: "【闪电】" });
     } else passLightning(state, continuation.cardIds?.[0] ?? "", judgment.targetId);
     return;
   }
@@ -2425,7 +2573,7 @@ function applyJudgmentWithCard(
     discardJudge();
     const use = continuation.use!;
     const source = player(state, use.sourceId);
-    const required = hasSkill(source, "wushuang") ? 2 : 1;
+    const required = source.alive && hasSkill(source, "wushuang") ? 2 : 1;
     if (card.color === "red" && required === 1) {
       addLog(state, `${player(state, judgment.targetId).name} 的【八卦阵】判定成功。`, "good", context);
       afterShaDodged(state, use, judgment.targetId, context);
@@ -2440,8 +2588,7 @@ function applyJudgmentWithCard(
 
 function resolveLuoshenContinue(state: GameStateV2, actor: GamePlayerV2, action: GameActionV2, context?: EngineContextV2) {
   state.pending = null;
-  if (action.type === "pass") pushFrame(state, "preparePhase");
-  else beginJudgment(state, actor.id, "洛神", { resume: "luoshen" }, context);
+  if (action.type !== "pass") beginJudgment(state, actor.id, "洛神", { resume: "luoshen" }, context);
 }
 
 function borrowShaActions(state: GameStateV2, actor: GamePlayerV2) {
@@ -2483,7 +2630,11 @@ function resolveBorrowSha(state: GameStateV2, actor: GamePlayerV2, action: GameA
     color: colors.size === 1 ? cards[0].color : "none", targets: [targetId], targetIndex: 0,
     ignoreArmor: actor.equipment.weapon?.name === "青釭剑", sourceSkill: action.skill,
   };
-  const borrowedSkillName = action.skill && action.skill in SKILLS ? SKILLS[action.skill as SkillId].name : undefined;
+  const borrowedSkillName = action.skill === "zhangba_response"
+    ? "丈八蛇矛"
+    : action.skill && action.skill in SKILLS
+      ? SKILLS[action.skill as SkillId].name
+      : undefined;
   addLog(state, `${actor.name}${borrowedSkillName ? ` 发动【${borrowedSkillName}】，将 ${publicCardList(cards)} 当【杀】` : ` 使用 ${publicCardList(cards)}`}响应【借刀杀人】，目标是 ${player(state, targetId).name}。`, "normal", context, { kind: "use", actorId: actor.id, sourceId: actor.id, targetIds: [targetId], cardName: "杀", cardNames: cards.map((card) => card.name), count: cards.length });
   pushFrame(state, "resolveUse", { use });
 }
@@ -2563,7 +2714,7 @@ function liuliPairs(state: GameStateV2, use: CardUse, target: GamePlayerV2) {
   const pairs: Array<{ card: Card; target: GamePlayerV2 }> = [];
   for (const card of allOwnedCards(target)) {
     for (const candidate of alivePlayers(state)) {
-      if (candidate.id === target.id || candidate.id === source.id || use.targets.includes(candidate.id)) continue;
+      if (candidate.id === target.id || candidate.id === source.id) continue;
       if (cannotTarget(state, source, candidate, "杀")) continue;
       if (distanceAfterCost(state, target, candidate, card.id) > attackRangeAfterCost(target, card.id)) continue;
       pairs.push({ card, target: candidate });
@@ -2576,13 +2727,6 @@ function resolveShaEffect(state: GameStateV2, use: CardUse, target: GamePlayerV2
   if (!target.alive) return;
   const source = player(state, use.sourceId);
   const flags = shaFlags(use, target.id);
-  if (!flags.tieqi) {
-    flags.tieqi = true;
-    if (hasSkill(source, "tieqi")) {
-      setPending(state, "tieqi", source.id, `是否对 ${target.name} 发动【铁骑】？`, { use, targetId: target.id });
-      return;
-    }
-  }
   if (!flags.liuli) {
     flags.liuli = true;
     if (hasSkill(target, "liuli") && liuliPairs(state, use, target).length > 0) {
@@ -2590,9 +2734,16 @@ function resolveShaEffect(state: GameStateV2, use: CardUse, target: GamePlayerV2
       return;
     }
   }
+  if (!flags.tieqi) {
+    flags.tieqi = true;
+    if (source.alive && hasSkill(source, "tieqi")) {
+      setPending(state, "tieqi", source.id, `是否对 ${target.name} 发动【铁骑】？`, { use, targetId: target.id });
+      return;
+    }
+  }
   if (!flags.cixiong) {
     flags.cixiong = true;
-    if (source.equipment.weapon?.name === "雌雄双股剑" && source.character?.gender !== target.character?.gender) {
+    if (source.alive && source.equipment.weapon?.name === "雌雄双股剑" && source.character?.gender !== target.character?.gender) {
       setPending(state, "cixiong", source.id, `是否对 ${target.name} 发动【雌雄双股剑】？`, { use, targetId: target.id });
       return;
     }
@@ -2609,7 +2760,7 @@ function resolveShaEffect(state: GameStateV2, use: CardUse, target: GamePlayerV2
     setPending(state, "optionalSkill", target.id, "是否发动【八卦阵】判定？", { skill: "bagua", resume: "sha", use, targetId: target.id });
     return;
   }
-  const required = hasSkill(source, "wushuang") ? 2 : 1;
+  const required = source.alive && hasSkill(source, "wushuang") ? 2 : 1;
   setPending(state, "response", target.id, `请打出${required > 1 ? "两张" : ""}【闪】`, {
     required: "闪", remaining: required, use, targetId: target.id, kind: "sha", baguaTried: Boolean(use.ignoreArmor),
   });
@@ -2640,8 +2791,6 @@ function resolveLiuli(state: GameStateV2, actor: GamePlayerV2, action: GameActio
   const redirectedId = action.targetId!;
   const originalFlags = shaFlags(use, targetId);
   const redirectedFlags = shaFlags(use, redirectedId);
-  redirectedFlags.tieqi = true;
-  redirectedFlags.liuli = true;
   redirectedFlags.noDodge = originalFlags.noDodge;
   addLog(state, `${actor.name} 弃置 ${publicCardLabel(card)} 发动【流离】，将【杀】转移给 ${player(state, redirectedId).name}。`, "good", context, { kind: "discard", actorId: actor.id, sourceId: actor.id, targetIds: [redirectedId], cardName: card.name, count: 1, zone: "discard" });
   pushFrame(state, "applyCardEffect", { use, targetId: redirectedId });
@@ -2818,10 +2967,6 @@ function qinglongActions(state: GameStateV2, actor: GamePlayerV2) {
     `再使用【杀】${skill ? `（${SKILLS[skill as SkillId]?.name ?? skill}）` : ""}`,
     { type: "respond", cardId: card.id, as: "杀", skill },
   ));
-  if (actor.equipment.weapon?.name === "丈八蛇矛" && actor.hand.length >= 2) actions.push({
-    id: "qinglong:zhangba", kind: "skill", skill: "qinglong_zhangba", label: "两张手牌当【杀】",
-    candidateCardIds: actor.hand.map((card) => card.id), minCards: 2, maxCards: 2,
-  });
   actions.push(exact("qinglong:pass", "不再使用【杀】", { type: "pass" }));
   return actions;
 }
@@ -2917,7 +3062,10 @@ function loseHp(state: GameStateV2, targetId: string, amount: number, sourceId: 
 function beginJudgment(state: GameStateV2, targetId: string, reason: string, continuation: Record<string, unknown>, context?: EngineContextV2) {
   recycleDeck(state, context);
   const card = state.deck.pop();
-  if (!card) return;
+  if (!card) {
+    continueWithoutJudgment(state, targetId, reason, dataAs<JudgmentContinuation>(continuation), context);
+    return;
+  }
   state.processing.push(card);
   const judgmentStart = state.turn?.playerId ?? targetId;
   const guicaiOrder = actionOrder(state, judgmentStart, true).filter((entry) => hasSkill(entry, "guicai")).map((entry) => entry.id);
@@ -2987,7 +3135,7 @@ function eliminate(state: GameStateV2, targetId: string, sourceId?: string, cont
       state.triggers = state.triggers.filter((trigger) => trigger.actorId !== target.id);
       addLog(state, `${target.name} 的下一名武将 ${replacement.name} 登场，摸四张牌。`, "system", context);
       if (defeatedDuringOwnTurn) {
-        state.duelTurnTerminated = true;
+        state.turnTerminated = true;
         const phaseFrames = new Set(["enterPhase", "preparePhase", "judgePhase", "drawPhase", "discardPhase", "finishPhase", "endTurn"]);
         state.stack = state.stack.filter((frame) => !phaseFrames.has(frame.kind));
       }
@@ -3009,13 +3157,9 @@ function eliminate(state: GameStateV2, targetId: string, sourceId?: string, cont
   }
   checkVictory(state, context);
   if (state.status !== "finished" && state.turn?.playerId === target.id) {
-    state.stack = [];
-    const living = alivePlayers(state);
-    const next = living.find((entry) => entry.seat > target.seat) ?? living[0] ?? null;
-    if (next) {
-      if (next.seat <= target.seat) state.round += 1;
-      beginTurn(state, next.id, context);
-    }
+    state.turnTerminated = true;
+    const phaseFrames = new Set(["enterPhase", "preparePhase", "judgePhase", "drawPhase", "discardPhase", "finishPhase", "endTurn"]);
+    state.stack = state.stack.filter((frame) => !phaseFrames.has(frame.kind));
   }
 }
 
@@ -3047,6 +3191,12 @@ function checkVictory(state: GameStateV2, context?: EngineContextV2) {
     };
   }
   if (state.winner) {
+    state.discard.push(...state.processing.map(restorePhysicalCard), ...state.revealed.map(restorePhysicalCard));
+    state.processing = [];
+    state.revealed = [];
+    state.triggers = [];
+    state.turnTerminated = false;
+    state.duelTurnTerminated = false;
     state.status = "finished";
     state.turn = null;
     state.pending = null;
@@ -3111,11 +3261,14 @@ export function assertGameInvariantV2(state: GameStateV2) {
   if (state.status === "playing") {
     if (!state.turn) throw new Error("进行中的对局缺少回合");
     if (state.winner) throw new Error("进行中的对局不应已有胜者");
-    if (!state.players.some((entry) => entry.id === state.turn!.playerId && entry.alive)) throw new Error("当前回合指向无效或阵亡玩家");
+    if (!state.players.some((entry) => entry.id === state.turn!.playerId && entry.alive)
+      && !state.turnTerminated
+      && !state.duelTurnTerminated) throw new Error("当前回合指向无效或阵亡玩家");
   }
   if (state.status === "finished") {
     if (!state.winner?.playerIds.length) throw new Error("结束的对局缺少胜者");
     if (state.turn || state.pending || state.stack.length) throw new Error("结束的对局仍残留回合、决策或结算栈");
+    if (state.processing.length || state.revealed.length || state.triggers.length) throw new Error("结束的对局仍残留临时牌区或触发队列");
   }
 }
 
