@@ -117,6 +117,17 @@ test("a turn owner killed during a duel hands the turn to the next living seat",
   loyalist.role = "loyalist";
   rebel.role = "rebel";
   renegade.role = "renegade";
+  rebel.character = {
+    id: "duel-regression-general",
+    name: "回归武将",
+    title: "确定性测试",
+    kingdom: "shu",
+    gender: "male",
+    maxHp: 4,
+    skill: "paoxiao",
+    skillName: "咆哮",
+    skillText: "出牌阶段使用【杀】无次数限制。",
+  };
   rebel.hp = 1;
   for (const participant of state.players) {
     state.discard.push(...participant.hand.filter((card) => card.name === "桃"));

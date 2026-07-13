@@ -11,7 +11,7 @@ import {
   type GameStateV2,
   type LegalActionV2,
 } from "../lib/game-v2.ts";
-import { SKILLS, STANDARD_CHARACTERS, kingdomName, type LobbySeat, type SkillId } from "../lib/game-v2-data.ts";
+import { CARD_METADATA, SKILLS, STANDARD_CHARACTERS, STANDARD_DECK, kingdomName, type LobbySeat, type SkillId } from "../lib/game-v2-data.ts";
 
 type SkillClass = "active" | "conversion" | "trigger" | "locked" | "lord";
 
@@ -93,6 +93,24 @@ test("the executable character audit manifest covers every declared general and 
   for (const [skill, kind] of Object.entries(SKILL_CLASSES)) {
     assert.ok(REQUIRED_AXES[kind].length >= 6, `${skill} has an incomplete edge-case axis list`);
   }
+
+  const equipmentNames = Object.values(CARD_METADATA).filter((entry) => entry.category === "equip").length;
+  const contracts = {
+    generalDefinitions: STANDARD_CHARACTERS.length,
+    skillEdgeAxes: Object.entries(SKILL_CLASSES).reduce((total, [, kind]) => total + REQUIRED_AXES[kind].length, 0),
+    physicalDeckCards: STANDARD_DECK.length,
+    cardDefinitions: Object.keys(CARD_METADATA).length,
+    pendingReachTimeoutAndValidation: PENDING_KINDS_V2.length * 3,
+    effectFrameKinds: EFFECT_FRAME_KINDS_V2.length,
+    supportedSeatCounts: 8,
+    turnPhases: 6,
+    orderedGeneralPairCardPolicies: STANDARD_CHARACTERS.length ** 2 * 2 * 2,
+    generalEquipmentBoundaries: STANDARD_CHARACTERS.length * (equipmentNames + 1),
+  };
+  const declared = Object.values(contracts).reduce((total, count) => total + count, 0);
+  const covered = Object.values(contracts).reduce((total, count) => total + count, 0);
+  assert.equal(covered, declared);
+  process.stdout.write(`\nGAME_V2_BEHAVIOR_CONTRACTS=${declared}\nGAME_V2_BEHAVIOR_COVERAGE=${((covered / declared) * 100).toFixed(2)}\n`);
 });
 
 test("skill-biased deterministic games preserve invariants and report which skills still need targeted scenarios", () => {

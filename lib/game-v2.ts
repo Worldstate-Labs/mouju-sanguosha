@@ -1283,7 +1283,7 @@ function pendingActions(state: GameStateV2, actor: GamePlayerV2): LegalActionV2[
   if (pending.kind === "damageTrigger") return damageTriggerActions(state, actor);
   if (pending.kind === "fankui") return fankuiActions(state, actor);
   if (pending.kind === "ganglieChoice") return ganglieChoiceActions(state, actor);
-  if (pending.kind === "yijiAssign") return yijiAssignActions(state, actor);
+  if (pending.kind === "yijiAssign") return yijiAssignActions(state);
   if (pending.kind === "liuli") return liuliActions(state, actor);
   if (pending.kind === "tieqi") return yesNoActions("铁骑", "tieqi");
   if (pending.kind === "cixiong") return yesNoActions("雌雄双股剑", "cixiong");
@@ -1291,7 +1291,7 @@ function pendingActions(state: GameStateV2, actor: GamePlayerV2): LegalActionV2[
   if (pending.kind === "hanbing") return yesNoActions("寒冰剑", "hanbing");
   if (pending.kind === "hanbingChoice") return hanbingChoiceActions(state, actor);
   if (pending.kind === "qinglong") return qinglongActions(state, actor);
-  if (pending.kind === "guanshi") return guanshiActions(state, actor);
+  if (pending.kind === "guanshi") return guanshiActions(actor);
   if (pending.kind === "qilin") return qilinActions(state, actor);
   if (pending.kind === "lordRequest") return lordRequestActions(state, actor);
   return [];
@@ -1320,6 +1320,14 @@ function publicCardList(cards: Card[]) {
   return cards.map(publicCardLabel).join("、");
 }
 
+function selectedCardIds(action: GameActionV2) {
+  return action.cardIds ?? (action.cardId ? [action.cardId] : []);
+}
+
+function selectedTargetIds(action: GameActionV2) {
+  return action.targetIds ?? (action.targetId ? [action.targetId] : []);
+}
+
 function sameAction(left: GameActionV2, right: GameActionV2) {
   const canonicalize = (value: unknown): unknown => {
     if (Array.isArray(value)) return value.map(canonicalize);
@@ -1339,24 +1347,31 @@ function sameAction(left: GameActionV2, right: GameActionV2) {
   return JSON.stringify(canonicalize(semantic(left))) === JSON.stringify(canonicalize(semantic(right)));
 }
 
-function validateSubmission(state: GameStateV2, actorId: string, action: GameActionV2) {
-  const legal = getLegalActionsV2(state, actorId);
-  const exactMatch = legal.some((entry) => entry.kind === "exact" && entry.action && sameAction(entry.action, action));
-  if (exactMatch) return;
-  const template = legal.find((entry) => entry.kind !== "exact" && entry.skill === action.skill)
-    ?? legal.find((entry) => entry.kind === "discard" && action.type === "discard");
-  if (!template) throw new Error("该动作不在当前服务器合法动作中");
+function validateTemplateSelection(template: LegalActionV2, action: GameActionV2) {
   const expectedType = template.kind === "skill" ? "skill" : template.kind;
   if (action.type !== expectedType) throw new Error("动作类型不合法");
-  const cards = [...new Set(action.cardIds ?? [])];
-  const targets = [...new Set(action.targetIds ?? (action.targetId ? [action.targetId] : []))];
-  if (cards.length !== (action.cardIds ?? []).length || targets.length !== (action.targetIds ?? (action.targetId ? [action.targetId] : [])).length) {
+  const submittedCards = selectedCardIds(action);
+  const submittedTargets = selectedTargetIds(action);
+  const cards = [...new Set(submittedCards)];
+  const targets = [...new Set(submittedTargets)];
+  if (cards.length !== submittedCards.length || targets.length !== submittedTargets.length) {
     throw new Error("不能重复选择牌或目标");
   }
   if (cards.length < (template.minCards ?? 0) || cards.length > (template.maxCards ?? Number.POSITIVE_INFINITY)) throw new Error("所选牌数量不合法");
   if (targets.length < (template.minTargets ?? 0) || targets.length > (template.maxTargets ?? Number.POSITIVE_INFINITY)) throw new Error("所选目标数量不合法");
   if (cards.some((id) => !template.candidateCardIds?.includes(id))) throw new Error("所选牌不在候选范围内");
   if (targets.some((id) => !template.targetIds?.includes(id))) throw new Error("所选目标不在候选范围内");
+  return { ...action, cardIds: cards, targetIds: targets };
+}
+
+function validateSubmission(state: GameStateV2, actorId: string, action: GameActionV2) {
+  const legal = getLegalActionsV2(state, actorId);
+  const exactMatch = legal.some((entry) => entry.kind === "exact" && entry.action && sameAction(entry.action, action));
+  if (exactMatch) return action;
+  const template = legal.find((entry) => entry.kind !== "exact" && entry.skill === action.skill)
+    ?? legal.find((entry) => entry.kind === "discard" && action.type === "discard");
+  if (!template) throw new Error("该动作不在当前服务器合法动作中");
+  return validateTemplateSelection(template, action);
 }
 
 export function applyGameActionV2(
@@ -1370,9 +1385,9 @@ export function applyGameActionV2(
   const actor = player(next, actorId);
   if (!actor.alive) throw new Error("已阵亡角色不能行动");
   if (next.pending?.id && action.decisionId && action.decisionId !== next.pending.id) throw new Error("决策已经变化，请重新观察");
-  validateSubmission(next, actorId, action);
-  if (next.pending) resolvePendingAction(next, actor, action, context);
-  else resolvePlayAction(next, actor, action, context);
+  const validatedAction = validateSubmission(next, actorId, action);
+  if (next.pending) resolvePendingAction(next, actor, validatedAction, context);
+  else resolvePlayAction(next, actor, validatedAction, context);
   advance(next, context);
   stampDeadline(next, context);
   assertGameInvariantV2(next);
@@ -1386,7 +1401,7 @@ function resolvePendingAction(state: GameStateV2, actor: GamePlayerV2, action: G
   if (pending.kind === "duelLineup") return handleDuelLineup(state, actor, action, context);
   if (pending.kind === "chooseCharacter") return handleChooseCharacter(state, action, context);
   if (pending.kind === "discardPhase") {
-    const discarded = removeOwnedCardsTracked(state, actor, action.cardIds ?? []).map((entry) => entry.card);
+    const discarded = removeOwnedCardsTracked(state, actor, selectedCardIds(action)).map((entry) => entry.card);
     state.discard.push(...discarded);
     state.pending = null;
     addLog(state, `${actor.name} 弃置 ${discarded.length} 张手牌：${publicCardList(discarded)}。`, "normal", context, { kind: "discard", actorId: actor.id, sourceId: actor.id, cardNames: discarded.map((card) => card.name), count: discarded.length, zone: "discard" });
@@ -1501,14 +1516,15 @@ function resolveDrawChoice(state: GameStateV2, actor: GamePlayerV2, action: Game
     draw(state, actor.id, normalDraw, context);
     addLog(state, `${actor.name} 摸 ${normalDraw} 张牌。`, "normal", context);
   } else if (skill === "tuxi") {
-    for (const id of action.targetIds ?? []) {
+    for (const id of selectedTargetIds(action)) {
       const target = player(state, id);
       if (target.hand.length) {
         const cardId = target.hand[randomInt(state, target.hand.length)].id;
         actor.hand.push(removeOwnedCardsTracked(state, target, [cardId])[0].card);
       }
     }
-    addLog(state, `${actor.name} 发动【突袭】，获得 ${action.targetIds?.length ?? 0} 张手牌。`, "good", context, { kind: "transfer", actorId: actor.id, sourceId: action.targetIds?.[0], targetIds: [actor.id], count: action.targetIds?.length ?? 0, zone: "hand" });
+    const targetIds = selectedTargetIds(action);
+    addLog(state, `${actor.name} 发动【突袭】，获得 ${targetIds.length} 张手牌。`, "good", context, { kind: "transfer", actorId: actor.id, sourceId: targetIds[0], targetIds: [actor.id], count: targetIds.length, zone: "hand" });
   } else if (skill === "luoyi") {
     const count = Math.max(0, normalDraw - 1);
     draw(state, actor.id, count, context);
@@ -1546,27 +1562,28 @@ function beginGuanxing(state: GameStateV2, actor: GamePlayerV2, context?: Engine
 function resolveActiveSkill(state: GameStateV2, actor: GamePlayerV2, action: GameActionV2, context?: EngineContextV2) {
   const skill = action.skill ?? "";
   if (skill === "zhangba") {
-    startVirtualSha(state, actor, action.cardIds ?? [], action.targetIds?.[0] ?? action.targetId ?? "", "zhangba", context);
+    startVirtualSha(state, actor, selectedCardIds(action), selectedTargetIds(action)[0], "zhangba", context);
     return;
   }
   if (skill === "rende") {
-    const target = player(state, action.targetIds?.[0] ?? action.targetId!);
-    target.hand.push(...removeOwnedCardsTracked(state, actor, action.cardIds ?? []).map((entry) => entry.card));
+    const target = player(state, selectedTargetIds(action)[0]);
+    target.hand.push(...removeOwnedCardsTracked(state, actor, selectedCardIds(action)).map((entry) => entry.card));
     const before = Number(state.turn!.stats.rendeCount ?? 0);
-    const after = before + (action.cardIds?.length ?? 0);
+    const after = before + selectedCardIds(action).length;
     state.turn!.stats.rendeCount = after;
     if (before < 2 && after >= 2) {
       state.turn!.stats.rendeHealed = true;
       actor.hp = Math.min(actor.maxHp, actor.hp + 1);
     }
-    addLog(state, `${actor.name} 发动【仁德】，交给 ${target.name} ${action.cardIds?.length ?? 0} 张牌。`, "good", context, { kind: "transfer", actorId: actor.id, sourceId: actor.id, targetIds: [target.id], count: action.cardIds?.length ?? 0, zone: "hand" });
+    const count = selectedCardIds(action).length;
+    addLog(state, `${actor.name} 发动【仁德】，交给 ${target.name} ${count} 张牌。`, "good", context, { kind: "transfer", actorId: actor.id, sourceId: actor.id, targetIds: [target.id], count, zone: "hand" });
     return;
   }
   if (skill === "zhiheng") {
-    const discarded = removeOwnedCardsTracked(state, actor, action.cardIds ?? []).map((entry) => entry.card);
+    const discarded = removeOwnedCardsTracked(state, actor, selectedCardIds(action)).map((entry) => entry.card);
     state.discard.push(...discarded);
     state.turn!.usedSkills.push("zhiheng");
-    draw(state, actor.id, action.cardIds?.length ?? 0, context);
+    draw(state, actor.id, selectedCardIds(action).length, context);
     addLog(state, `${actor.name} 发动【制衡】，弃置 ${publicCardList(discarded)}，摸 ${discarded.length} 张牌。`, "good", context, { kind: "discard", actorId: actor.id, sourceId: actor.id, cardNames: discarded.map((card) => card.name), count: discarded.length, zone: "discard" });
     return;
   }
@@ -1583,13 +1600,13 @@ function resolveActiveSkill(state: GameStateV2, actor: GamePlayerV2, action: Gam
   if (skill === "fanjian") {
     state.turn!.usedSkills.push("fanjian");
     const committedCardId = actor.hand[randomInt(state, actor.hand.length)].id;
-    setPending(state, "chooseSuit", action.targetIds?.[0] ?? action.targetId!, "反间：请选择一种花色", { sourceId: actor.id, committedCardId });
+    setPending(state, "chooseSuit", selectedTargetIds(action)[0], "反间：请选择一种花色", { sourceId: actor.id, committedCardId });
     return;
   }
   if (skill === "jieyin") {
-    const discarded = removeOwnedCardsTracked(state, actor, action.cardIds ?? []).map((entry) => entry.card);
+    const discarded = removeOwnedCardsTracked(state, actor, selectedCardIds(action)).map((entry) => entry.card);
     state.discard.push(...discarded);
-    const target = player(state, action.targetIds?.[0] ?? action.targetId!);
+    const target = player(state, selectedTargetIds(action)[0]);
     actor.hp = Math.min(actor.maxHp, actor.hp + 1);
     target.hp = Math.min(target.maxHp, target.hp + 1);
     state.turn!.usedSkills.push("jieyin");
@@ -1599,7 +1616,7 @@ function resolveActiveSkill(state: GameStateV2, actor: GamePlayerV2, action: Gam
   if (skill === "qingnang") {
     const discarded = removeOwnedCardsTracked(state, actor, [action.cardIds![0]])[0].card;
     state.discard.push(discarded);
-    const target = player(state, action.targetIds?.[0] ?? action.targetId!);
+    const target = player(state, selectedTargetIds(action)[0]);
     target.hp = Math.min(target.maxHp, target.hp + 1);
     state.turn!.usedSkills.push("qingnang");
     addLog(state, `${actor.name} 弃置 ${publicCardLabel(discarded)} 发动【青囊】，令 ${target.name} 回复1点体力。`, "good", context, { kind: "heal", actorId: actor.id, targetIds: [target.id], cardName: discarded.name, amount: 1 });
@@ -1609,7 +1626,7 @@ function resolveActiveSkill(state: GameStateV2, actor: GamePlayerV2, action: Gam
     const discarded = removeOwnedCardsTracked(state, actor, [action.cardIds![0]])[0].card;
     state.discard.push(discarded);
     state.turn!.usedSkills.push("lijian");
-    const [sourceId, targetId] = action.targetIds ?? [];
+    const [sourceId, targetId] = selectedTargetIds(action);
     const use: CardUse = { id: `u${state.frameSeq + 1}`, sourceId, name: "决斗", cardIds: [], color: "none", targets: [targetId], targetIndex: 0, noNullification: true, sourceSkill: "lijian" };
     pushFrame(state, "resolveUse", { use });
     addLog(state, `${actor.name} 弃置 ${publicCardLabel(discarded)} 发动【离间】，令 ${player(state, sourceId).name} 对 ${player(state, targetId).name} 发起【决斗】。`, "danger", context, { kind: "discard", actorId: actor.id, sourceId: actor.id, targetIds: [sourceId, targetId], cardName: discarded.name, count: 1, zone: "discard" });
@@ -1643,7 +1660,7 @@ function startCardUse(state: GameStateV2, actor: GamePlayerV2, action: GameActio
   const physical = removed.card;
   const name = action.as as StandardCardName;
   state.processing.push(physical);
-  const targets = action.targetId ? [action.targetId] : action.targetIds ?? [];
+  const targets = selectedTargetIds(action);
   if (name === "闪电") targets.push(actor.id);
   if (["南蛮入侵", "万箭齐发"].includes(name)) targets.push(...actionOrder(state, actor.id, false).map((entry) => entry.id));
   if (name === "桃园结义" || name === "五谷丰登") targets.push(...actionOrder(state, actor.id, true).map((entry) => entry.id));
@@ -1896,7 +1913,7 @@ function resolveGanglieChoice(state: GameStateV2, actor: GamePlayerV2, action: G
   const { ownerId } = dataAs<{ ownerId: string }>(state.pending!.data);
   state.pending = null;
   if (action.skill === "ganglie_discard") {
-    const discarded = removeOwnedCardsTracked(state, actor, action.cardIds ?? []).map((entry) => entry.card);
+    const discarded = removeOwnedCardsTracked(state, actor, selectedCardIds(action)).map((entry) => entry.card);
     state.discard.push(...discarded);
     addLog(state, `${actor.name} 因【刚烈】弃置 ${publicCardList(discarded)}。`, "normal", context, { kind: "discard", actorId: actor.id, sourceId: actor.id, cardNames: discarded.map((card) => card.name), count: discarded.length, zone: "discard" });
   } else {
@@ -1904,7 +1921,7 @@ function resolveGanglieChoice(state: GameStateV2, actor: GamePlayerV2, action: G
   }
 }
 
-function yijiAssignActions(state: GameStateV2, actor: GamePlayerV2) {
+function yijiAssignActions(state: GameStateV2) {
   const { cardIds } = dataAs<{ cardIds: string[] }>(state.pending!.data);
   const card = findCardEverywhere(state, cardIds[0])!;
   return alivePlayers(state).map((target) => exact(
@@ -1912,7 +1929,6 @@ function yijiAssignActions(state: GameStateV2, actor: GamePlayerV2) {
     `将【${card.name}】${suitSymbol(card.suit)}${card.rank}交给 ${target.name}`,
     { type: "choose", cardId: card.id, targetId: target.id },
   ));
-  void actor;
 }
 
 function resolveYijiAssign(state: GameStateV2, actor: GamePlayerV2, action: GameActionV2, context?: EngineContextV2) {
@@ -2037,7 +2053,7 @@ function resolveLordRequest(state: GameStateV2, actor: GamePlayerV2, action: Gam
     beginJudgment(state, actor.id, "护驾·八卦阵", { resume: "hujiaBagua", lordRequest: data }, context);
     return;
   }
-  const ids = action.cardIds ?? (action.cardId ? [action.cardId] : []);
+  const ids = selectedCardIds(action);
   const cards = removeOwnedCardsTracked(state, actor, ids).map((entry) => entry.card);
   const lord = player(state, data.lordId);
   const providedName = data.skill === "hujia" ? "闪" : "杀";
@@ -2152,7 +2168,7 @@ function resolveResponseDecision(state: GameStateV2, actor: GamePlayerV2, action
     else if (data.kind === "duel") queueDamageFromUse(state, data.use, actor.id, data.opponentId);
     return;
   }
-  const ids = action.cardIds ?? (action.cardId ? [action.cardId] : []);
+  const ids = selectedCardIds(action);
   const physicalCards = removeOwnedCardsTracked(state, actor, ids).map((entry) => entry.card);
   state.discard.push(...physicalCards);
   state.turn!.stats.shaUsedOrPlayed ||= data.required === "杀"
@@ -2621,7 +2637,7 @@ function resolveBorrowSha(state: GameStateV2, actor: GamePlayerV2, action: GameA
     }
     return;
   }
-  const ids = action.cardIds ?? (action.cardId ? [action.cardId] : []);
+  const ids = selectedCardIds(action);
   const cards = removeOwnedCardsTracked(state, actor, ids).map((entry) => entry.card);
   state.processing.push(...cards);
   const colors = new Set(cards.map((entry) => entry.color));
@@ -2944,7 +2960,7 @@ function afterShaDodged(state: GameStateV2, use: CardUse, targetId: string, cont
   const source = player(state, use.sourceId);
   const target = player(state, targetId);
   if (!source.alive || !target.alive) return;
-  if (source.equipment.weapon?.name === "青龙偃月刀" && shaCardsFor(state, source).length > 0) {
+  if (source.equipment.weapon?.name === "青龙偃月刀" && shaCardsFor(source).length > 0) {
     setPending(state, "qinglong", source.id, `【青龙偃月刀】：可对 ${target.name} 再使用一张【杀】`, { targetId });
     return;
   }
@@ -2954,15 +2970,14 @@ function afterShaDodged(state: GameStateV2, use: CardUse, targetId: string, cont
   void context;
 }
 
-function shaCardsFor(state: GameStateV2, actor: GamePlayerV2) {
+function shaCardsFor(actor: GamePlayerV2) {
   return allOwnedCards(actor).flatMap((card) => transformedOptions(actor, card, false)
     .filter((entry) => entry.name === "杀")
     .map((entry) => ({ card, skill: entry.skill })));
-  void state;
 }
 
 function qinglongActions(state: GameStateV2, actor: GamePlayerV2) {
-  const actions = shaCardsFor(state, actor).map(({ card, skill }) => exact(
+  const actions = shaCardsFor(actor).map(({ card, skill }) => exact(
     `qinglong:${card.id}:${skill ?? "sha"}`,
     `再使用【杀】${skill ? `（${SKILLS[skill as SkillId]?.name ?? skill}）` : ""}`,
     { type: "respond", cardId: card.id, as: "杀", skill },
@@ -2975,7 +2990,7 @@ function resolveQinglong(state: GameStateV2, actor: GamePlayerV2, action: GameAc
   const { targetId } = dataAs<{ targetId: string }>(state.pending!.data);
   state.pending = null;
   if (action.type === "pass") return;
-  const ids = action.cardIds ?? (action.cardId ? [action.cardId] : []);
+  const ids = selectedCardIds(action);
   const cards = removeOwnedCardsTracked(state, actor, ids).map((entry) => entry.card);
   state.processing.push(...cards);
   const colors = new Set(cards.map((card) => card.color));
@@ -2989,7 +3004,7 @@ function resolveQinglong(state: GameStateV2, actor: GamePlayerV2, action: GameAc
   pushFrame(state, "resolveUse", { use });
 }
 
-function guanshiActions(state: GameStateV2, actor: GamePlayerV2) {
+function guanshiActions(actor: GamePlayerV2) {
   return [
     {
       id: "guanshi:discard", kind: "skill", skill: "guanshi", label: "弃置两张牌，令【杀】命中",
@@ -2997,14 +3012,13 @@ function guanshiActions(state: GameStateV2, actor: GamePlayerV2) {
     },
     exact("guanshi:pass", "不发动【贯石斧】", { type: "pass" }),
   ];
-  void state;
 }
 
 function resolveGuanshi(state: GameStateV2, actor: GamePlayerV2, action: GameActionV2, context?: EngineContextV2) {
   const { use, targetId } = dataAs<{ use: CardUse; targetId: string }>(state.pending!.data);
   state.pending = null;
   if (action.type === "pass") return;
-  const discarded = removeOwnedCardsTracked(state, actor, action.cardIds ?? []).map((entry) => entry.card);
+  const discarded = removeOwnedCardsTracked(state, actor, selectedCardIds(action)).map((entry) => entry.card);
   state.discard.push(...discarded);
   addLog(state, `${actor.name} 弃置 ${publicCardList(discarded)} 发动【贯石斧】，令【杀】命中。`, "good", context, { kind: "discard", actorId: actor.id, sourceId: actor.id, cardNames: discarded.map((card) => card.name), count: discarded.length, zone: "discard" });
   queueShaDamage(state, use, targetId, context);
@@ -3275,3 +3289,54 @@ export function assertGameInvariantV2(state: GameStateV2) {
 export const v2RoleName = roleName;
 export const v2KingdomName = kingdomName;
 export { RANK_ORDER };
+
+/** @internal Deterministic access to defensive rule paths for engine tests only. */
+export const gameV2TestHooks = Object.freeze({
+  characterById,
+  randomInt,
+  actionOrder,
+  nextAlive,
+  removeCard,
+  removeOwnedCard,
+  removeOwnedCardsTracked,
+  stampDeadline,
+  beginDuelSetup,
+  duelLineupActions,
+  handleDuelColor,
+  handleDuelDraft,
+  handleDuelLineup,
+  handleChooseCharacter,
+  endTurn,
+  advance,
+  suitLabel,
+  suitSymbol,
+  validateTemplateSelection,
+  resolvePendingAction,
+  resolvePlayAction,
+  resolveDrawChoice,
+  resolveActiveSkill,
+  resolveYijiAssign,
+  resolveDyingFrame,
+  continueLordRequest,
+  lordRequestActions,
+  resolveLordRequest,
+  zoneChoiceActions,
+  continueResponseFrame,
+  resolveZoneChoice,
+  continueNullificationFrame,
+  resolveGuanxingChoice,
+  applyJudgmentOutcome,
+  continueWithoutJudgment,
+  applyJudgmentWithCard,
+  liuliPairs,
+  resolveLiuli,
+  resolveHanbingChoice,
+  qinglongActions,
+  resolveQinglong,
+  dealDamage,
+  loseHp,
+  beginJudgment,
+  passLightning,
+  eliminate,
+  checkVictory,
+});
